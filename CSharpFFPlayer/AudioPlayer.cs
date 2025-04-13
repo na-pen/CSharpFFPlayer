@@ -1,140 +1,201 @@
 ﻿using NAudio.Wave;
 using NAudio.CoreAudioApi;
+using NAudio.Wave.SampleProviders;
 using System;
 using System.IO;
-using System.Threading;
-using NAudio.Wave;
-using NAudio.CoreAudioApi;
-using NAudio.CoreAudioApi.Interfaces;
-using NAudio.Wave.SampleProviders;
-using FFmpegPlayer;
-using NAudio.Wave;
-using NAudio.Wave.SampleProviders;
+using System.Threading.Tasks;
 
 namespace CSharpFFPlayer
 {
     class AudioPlayer : IDisposable
     {
         private WasapiOut output;
-        public TimeSpan BufferedDuration => bufferedWaveProvider.BufferedDuration;
         private BufferedWaveProvider bufferedWaveProvider;
-        public int AverageBytesPerSecond => output.OutputWaveFormat.AverageBytesPerSecond;
+        private IWaveProvider finalProvider;
+
+        /// <summary>
+        /// 現在のバッファに保持されている音声の持続時間（ミリ秒単位）
+        /// </summary>
+        public TimeSpan BufferedDuration => bufferedWaveProvider?.BufferedDuration ?? TimeSpan.Zero;
+
+        /// <summary>
+        /// 出力フォーマットに基づく1秒あたりの平均バイト数
+        /// </summary>
+        public int AverageBytesPerSecond => output?.OutputWaveFormat.AverageBytesPerSecond ?? 0;
 
         public AudioPlayer() { }
 
-        public void Init(WaveFormat? inputFormat = null, float volume = 1.0f, int latency = 200)
+        /// <summary>
+        /// オーディオ出力の初期化処理。必要なWaveFormatやボリューム、遅延時間（ミリ秒）を設定する。
+        /// </summary>
+        public void Init(WaveFormat? inputFormat = null, float volume = 1.0f, int latencyMs = 200)
         {
-            var mmDevice = new MMDeviceEnumerator()
-                .GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            var deviceEnumerator = new MMDeviceEnumerator();
+            var mmDevice = deviceEnumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
 
-            var mixFormat = mmDevice.AudioClient.MixFormat;
-            WaveFormat waveFormat = inputFormat ?? mixFormat;
+            var waveFormat = inputFormat ?? mmDevice.AudioClient.MixFormat;
 
             bufferedWaveProvider = new BufferedWaveProvider(waveFormat)
             {
-                BufferDuration = TimeSpan.FromSeconds(30),
-                DiscardOnBufferOverflow = false,
+                BufferDuration = TimeSpan.FromMilliseconds(30000),
+                DiscardOnBufferOverflow = false
             };
 
-            IWaveProvider finalProvider;
+            finalProvider = CreateOutputProvider(waveFormat, volume);
 
-            if (waveFormat.Encoding == WaveFormatEncoding.IeeeFloat)
-            {
-                // float 形式の場合
-                var sampleProvider = bufferedWaveProvider.ToSampleProvider();
-
-                // 3ch以上 → 2chへダウンミックス（先頭2chのみ使用）
-                if (waveFormat.Channels > 2)
-                {
-                    sampleProvider = new StereoSampleProvider(sampleProvider);
-                }
-
-                var volumeSample = new SampleChannel(sampleProvider.ToWaveProvider(), true)
-                {
-                    Volume = volume
-                };
-
-                finalProvider = volumeSample.ToWaveProvider();
-            }
-            else if (waveFormat.Encoding == WaveFormatEncoding.Pcm && waveFormat.BitsPerSample == 16)
-            {
-                // 16bit PCM の場合
-                IWaveProvider pcmProvider = bufferedWaveProvider;
-
-                if (waveFormat.Channels > 2)
-                {
-                    // PCMのチャンネル数が3ch以上 → floatに変換してダウンミックス
-                    var floatProvider = bufferedWaveProvider.ToSampleProvider();
-                    var stereoProvider = new StereoSampleProvider(floatProvider);
-                    var volumeSample = new SampleChannel(stereoProvider.ToWaveProvider(), true)
-                    {
-                        Volume = volume
-                    };
-
-                    finalProvider = volumeSample.ToWaveProvider();
-                }
-                else
-                {
-                    finalProvider = new VolumeWaveProvider16(bufferedWaveProvider)
-                    {
-                        Volume = volume
-                    };
-                }
-            }
-            else
-            {
-                throw new NotSupportedException($"Unsupported WaveFormat: {waveFormat.Encoding} {waveFormat.BitsPerSample}bit");
-            }
-
-            output = new WasapiOut(mmDevice, AudioClientShareMode.Shared, false, latency);
+            output = new WasapiOut(mmDevice, AudioClientShareMode.Shared, false, latencyMs);
             output.Init(finalProvider);
 
-            Console.WriteLine($"Using audio device: {mmDevice.FriendlyName}");
+            Console.WriteLine($"[Audio] Initialized with device: {mmDevice.FriendlyName}");
         }
 
+        /// <summary>
+        /// 出力用プロバイダを作成する。フォーマットに応じてダウンミックスや音量調整を行う。
+        /// </summary>
+        private IWaveProvider CreateOutputProvider(WaveFormat format, float volume)
+        {
+            if (bufferedWaveProvider == null)
+                throw new InvalidOperationException("BufferedWaveProvider is not initialized.");
+
+            if (format.Encoding == WaveFormatEncoding.IeeeFloat)
+            {
+                var sampleProvider = bufferedWaveProvider.ToSampleProvider();
+
+                if (format.Channels > 2)
+                    sampleProvider = new StereoSampleProvider(sampleProvider);
+
+                var volumeSample = new SampleChannel(sampleProvider.ToWaveProvider(), true) { Volume = volume };
+                return volumeSample.ToWaveProvider();
+            }
+
+            if (format.Encoding == WaveFormatEncoding.Pcm && format.BitsPerSample == 16)
+            {
+                if (format.Channels > 2)
+                {
+                    var stereoProvider = new StereoSampleProvider(bufferedWaveProvider.ToSampleProvider());
+                    var volumeSample = new SampleChannel(stereoProvider.ToWaveProvider(), true) { Volume = volume };
+                    return volumeSample.ToWaveProvider();
+                }
+
+                return new VolumeWaveProvider16(bufferedWaveProvider) { Volume = volume };
+            }
+
+            throw new NotSupportedException($"Unsupported WaveFormat: {format.Encoding} {format.BitsPerSample}bit");
+        }
+
+        /// <summary>
+        /// 現在の再生バイト位置を取得する（再生済みバイト数）
+        /// </summary>
         public long GetPosition()
         {
-            return output.GetPosition();
+            return output?.GetPosition() ?? 0;
         }
 
+        /// <summary>
+        /// 音声の再生を開始する
+        /// </summary>
         public void Start()
         {
-            output.Play();
+            if (output == null)
+            {
+                Console.WriteLine("[Audio] Cannot start: output is not initialized.");
+                return;
+            }
+
+            try
+            {
+                output.Play();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Audio] Error on Start: {ex.Message}");
+            }
         }
 
+        /// <summary>
+        /// 音声の一時停止処理。再生中のみ適用される。
+        /// </summary>
         public void Pause()
         {
             if (output?.PlaybackState == PlaybackState.Playing)
             {
-                output.Pause();
+                try
+                {
+                    output.Pause();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Audio] Error on Pause: {ex.Message}");
+                }
             }
         }
 
+        /// <summary>
+        /// 一時停止状態からの再開
+        /// </summary>
         public void Resume()
         {
             if (output?.PlaybackState == PlaybackState.Paused)
             {
-                output.Play();
+                try
+                {
+                    output.Play();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Audio] Error on Resume: {ex.Message}");
+                }
             }
         }
 
+        /// <summary>
+        /// PCMストリームからデータを一定量ずつ読み取り、バッファに追加する（非同期）
+        /// </summary>
         public async Task FeedStreamAsync(Stream bufferedPCMStream)
         {
+            if (bufferedPCMStream == null || bufferedWaveProvider == null)
+            {
+                Console.WriteLine("[Audio] Stream is null or not initialized.");
+                return;
+            }
+
             byte[] buffer = new byte[bufferedWaveProvider.WaveFormat.AverageBytesPerSecond];
 
-            int bytesRead;
-            while ((bytesRead = await bufferedPCMStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+            try
             {
-                bufferedWaveProvider.AddSamples(buffer, 0, bytesRead);
-                await Task.Delay(50);
+                int bytesRead;
+                while ((bytesRead = await bufferedPCMStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                {
+                    bufferedWaveProvider.AddSamples(buffer, 0, bytesRead);
+                    await Task.Delay(50); // 過剰な供給を防ぐための短い待機
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Audio] Error during stream feed: {ex.Message}");
             }
         }
+
+        /// <summary>
+        /// 音声のバイト列データを直接バッファに追加する
+        /// </summary>
         public void AddAudioData(ReadOnlySpan<byte> audioData)
         {
-            bufferedWaveProvider.AddSamples(audioData.ToArray(), 0, audioData.Length);
+            if (bufferedWaveProvider == null) return;
+
+            try
+            {
+                bufferedWaveProvider.AddSamples(audioData.ToArray(), 0, audioData.Length);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Audio] Error while adding data: {ex.Message}");
+            }
         }
 
-
+        /// <summary>
+        /// 出力の破棄処理
+        /// </summary>
         public void Dispose()
         {
             output?.Dispose();

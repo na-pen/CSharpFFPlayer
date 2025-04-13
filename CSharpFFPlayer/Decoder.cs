@@ -14,81 +14,86 @@ namespace CSharpFFPlayer
 {
     public static class FFmpegErrors
     {
-        public const int AVERROR_EAGAIN = -11;            // Resource temporarily unavailable
-        public const int AVERROR_EOF = -541478725;        // End of file (AVERROR_EOF)
-        public const int AVERROR_EINVAL = -22;            // Invalid argument
-        public const int AVERROR_EIO = -5;                // I/O error
-                                                          // 必要に応じて追加可能
+        public const int AVERROR_EAGAIN = -11;             // 一時的なリソース不足
+        public const int AVERROR_EOF = -541478725;         // ストリームの終端（End of File）
+        public const int AVERROR_EINVAL = -22;             // 無効な引数
+        public const int AVERROR_EIO = -5;                 // 入出力エラー
+                                                           // public const int AVERROR_ENOMEM = -12;          // メモリ不足（必要に応じて追加）
+                                                           // public const int AVERROR_UNKNOWN = -1313558101; // 未知のエラー（環境依存）
     }
 
     public enum FrameReadResult
     {
-        FrameAvailable,
-        FrameNotReady,
-        EndOfStream
+        FrameAvailable,  // フレームが取得できた
+        FrameNotReady,   // フレームはまだ準備できていない（EAGAINなど）
+        EndOfStream      // ストリームの終端（EOF）
     }
 
     public unsafe class Decoder : IDisposable
     {
         public Decoder()
         {
-            ffmpeg.RootPath = @"ffmpeg";
-            //ffmpeg.av_register_all();
+            ffmpeg.RootPath = @"ffmpeg";  // 必要に応じて環境変数からの読み取りに置換可
+                                          // ffmpeg.av_register_all(); // FFmpeg 4.0以降は不要
         }
 
         private AVFormatContext* formatContext;
-        /// <summary>
-        /// 現在の <see cref="AVFormatContext"/> を取得します。
-        /// </summary>
-        public AVFormatContext FormatContext { get => *formatContext; }
-
         private AVStream* videoStream;
-        /// <summary>
-        /// 現在の動画ストリームを表す <see cref="AVStream"/> を取得します。
-        /// </summary>
-        public AVStream VideoStream { get => *videoStream; }
-
         private AVStream* audioStream;
 
         private AVCodec* videoCodec;
-        /// <summary>
-        /// 現在の動画コーデックを表す <see cref="AVCodec"/> を取得します。
-        /// </summary>
-        public AVCodec VideoCodec { get => *videoCodec; }
-
         private AVCodec* audioCodec;
 
         private AVCodecContext* videoCodecContext;
-        /// <summary>
-        /// 現在の動画コーデックの <see cref="AVCodecContext"/> を取得します。
-        /// </summary>
-        public AVCodecContext VideoCodecContext { get => *videoCodecContext; }
-
         private AVCodecContext* audioCodecContext;
-        public AVCodecContext AudioCodecContext => *audioCodecContext;
 
         private AVHWDeviceType? videoHardwareType = null;
 
-
         private bool isVideoFrameEnded;
+
+        /// <summary>
+        /// 現在の AVFormatContext を取得します。
+        /// </summary>
+        public AVFormatContext FormatContext => *formatContext;
+
+        /// <summary>
+        /// 現在の動画ストリーム（AVStream）を取得します。
+        /// </summary>
+        public AVStream VideoStream => *videoStream;
+
+        /// <summary>
+        /// 現在の動画コーデック（AVCodec）を取得します。
+        /// </summary>
+        public AVCodec VideoCodec => *videoCodec;
+
+        /// <summary>
+        /// 現在の動画コーデックコンテキスト（AVCodecContext）を取得します。
+        /// </summary>
+        public AVCodecContext VideoCodecContext => *videoCodecContext;
+
+        /// <summary>
+        /// 現在の音声コーデックコンテキスト（AVCodecContext）を取得します。
+        /// </summary>
+        public AVCodecContext AudioCodecContext => *audioCodecContext;
+
+        /// <summary>
+        /// 映像ストリームが終端に達したかどうかを取得します。
+        /// </summary>
         public bool IsVideoFrameEnded => isVideoFrameEnded;
 
         private unsafe AVCodec* TryGetHardwareDecoder(AVCodecID codecId, bool forceD3D11 = false)
         {
             if (forceD3D11 && (codecId == AVCodecID.AV_CODEC_ID_H264 || codecId == AVCodecID.AV_CODEC_ID_HEVC))
             {
-                Console.WriteLine("💡 D3D11VA を強制使用：通常デコーダと組み合わせます");
-                return ffmpeg.avcodec_find_decoder(codecId); // 通常のh264等
+                Console.WriteLine("[Info] D3D11VA 使用を強制。ソフトウェアデコーダを返します。");
+                return ffmpeg.avcodec_find_decoder(codecId);
             }
 
-            // ② GPU 情報から候補を探す（CUVID, QSV, AMF）
-            bool hasNvidia = false;
-            bool hasIntel = false;
-            bool hasAMD = false;
+            bool hasNvidia = false, hasIntel = false, hasAMD = false;
 
             try
             {
-                var searcher = new ManagementObjectSearcher("Select * from Win32_VideoController");
+                using var searcher = new ManagementObjectSearcher("Select * from Win32_VideoController");
                 foreach (var adapter in searcher.Get())
                 {
                     string name = adapter["Name"]?.ToString() ?? "";
@@ -99,113 +104,71 @@ namespace CSharpFFPlayer
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[GPU検出失敗] {ex.Message}（ハードウェアデコードの判定をスキップ）");
+                Console.WriteLine($"[Warn] GPU検出に失敗しました。ハードウェアデコーダの選択をスキップします: {ex.Message}");
             }
 
-            // ③ NVIDIA CUVID
-            if (hasNvidia)
+            // GPUベンダー別のデコーダ名を決定
+            (bool available, string? decoderName)[] candidates = new[]
             {
-                string? cuvidName = codecId switch
-                {
-                    AVCodecID.AV_CODEC_ID_H264 => "h264_cuvid",
-                    AVCodecID.AV_CODEC_ID_HEVC => "hevc_cuvid",
-                    _ => null
-                };
-                if (cuvidName != null)
-                {
-                    AVCodec* codec = ffmpeg.avcodec_find_decoder_by_name(cuvidName);
-                    if (codec != null && codec->id == codecId)
-                    {
-                        Console.WriteLine($"✅ NVIDIA デコーダを使用: {cuvidName}");
-                        return codec;
-                    }
-                }
-            }
+                (hasNvidia, codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_cuvid" :
+                    codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_cuvid" : null),
+                (hasIntel,  codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_qsv"   :
+                    codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_qsv"   : null),
+                (hasAMD,    codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_amf"   :
+                    codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_amf"   : null),
+            };
 
-            // ④ Intel QSV
-            if (hasIntel)
+            foreach (var (available, name) in candidates)
             {
-                string? qsvName = codecId switch
+                if (available && name != null)
                 {
-                    AVCodecID.AV_CODEC_ID_H264 => "h264_qsv",
-                    AVCodecID.AV_CODEC_ID_HEVC => "hevc_qsv",
-                    _ => null
-                };
-                if (qsvName != null)
-                {
-                    AVCodec* codec = ffmpeg.avcodec_find_decoder_by_name(qsvName);
+                    AVCodec* codec = ffmpeg.avcodec_find_decoder_by_name(name);
                     if (codec != null && codec->id == codecId)
                     {
-                        Console.WriteLine($"✅ Intel QSV デコーダを使用: {qsvName}");
-                        return codec;
-                    }
-                }
-            }
-
-            // ⑤ AMD AMF
-            if (hasAMD)
-            {
-                string? amfName = codecId switch
-                {
-                    AVCodecID.AV_CODEC_ID_H264 => "h264_amf",
-                    AVCodecID.AV_CODEC_ID_HEVC => "hevc_amf",
-                    _ => null
-                };
-                if (amfName != null)
-                {
-                    AVCodec* codec = ffmpeg.avcodec_find_decoder_by_name(amfName);
-                    if (codec != null && codec->id == codecId)
-                    {
-                        Console.WriteLine($"✅ AMD AMF デコーダを使用: {amfName}");
+                        Console.WriteLine($"[Info] ハードウェアデコーダを使用します: {name}");
                         return codec;
                     }
                 }
             }
 
             AVCodec* fallback = ffmpeg.avcodec_find_decoder(codecId);
-    Console.WriteLine($"⚙️ ソフトウェア/汎用デコーダを使用: {ffmpeg.avcodec_get_name(codecId)}");
-    return fallback;
-}
-
-
-
-
+            Console.WriteLine($"[Info] ハードウェアデコーダ未使用。ソフトウェアデコーダを使用します: {ffmpeg.avcodec_get_name(codecId)}");
+            return fallback;
+        }
 
         public unsafe AVFrame* TransferFrameToCPU(AVFrame* hwFrame)
         {
             if (hwFrame == null)
                 return null;
 
-            // GPU 上のフレーム形式かどうかを判定
             AVPixelFormat pixFmt = (AVPixelFormat)hwFrame->format;
-            bool isGPUFormat =
-                pixFmt == AVPixelFormat.AV_PIX_FMT_D3D11 ||
-                pixFmt == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD ||
-                pixFmt == AVPixelFormat.AV_PIX_FMT_QSV ||
-                pixFmt == AVPixelFormat.AV_PIX_FMT_CUDA ||
-                pixFmt == AVPixelFormat.AV_PIX_FMT_VAAPI;
+
+            bool isGPUFormat = pixFmt == AVPixelFormat.AV_PIX_FMT_D3D11 ||
+                               pixFmt == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD ||
+                               pixFmt == AVPixelFormat.AV_PIX_FMT_QSV ||
+                               pixFmt == AVPixelFormat.AV_PIX_FMT_CUDA ||
+                               pixFmt == AVPixelFormat.AV_PIX_FMT_VAAPI;
 
             if (!isGPUFormat)
                 return hwFrame; // GPUフレームでなければそのまま返す
 
             AVFrame* swFrame = ffmpeg.av_frame_alloc();
             if (swFrame == null)
-                throw new InvalidOperationException("CPUフレームの確保に失敗しました。");
+                throw new InvalidOperationException("CPUフレーム用のバッファ確保に失敗しました。");
 
-            // GPU → CPU 転送
             int err = ffmpeg.av_hwframe_transfer_data(swFrame, hwFrame, 0);
             if (err < 0)
             {
                 ffmpeg.av_frame_free(&swFrame);
                 var errbuf = stackalloc byte[1024];
                 ffmpeg.av_strerror(err, errbuf, 1024);
-                throw new InvalidOperationException($"GPUからCPUへのフレーム転送に失敗しました: {Marshal.PtrToStringAnsi((nint)errbuf)}");
+                throw new InvalidOperationException($"GPUフレームのCPU転送に失敗しました。原因: {Marshal.PtrToStringAnsi((nint)errbuf)}");
             }
 
-            // 解像度とフォーマットを引き継ぐ（必要に応じて）
+            // 解像度とフォーマットの明示的な設定
             swFrame->width = hwFrame->width;
             swFrame->height = hwFrame->height;
-            swFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12; // 多くのGPU出力はNV12（必要なら動的取得でもOK）
+            swFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12; // 多くのハードウェア出力はNV12フォーマット
 
             return swFrame;
         }
@@ -225,60 +188,57 @@ namespace CSharpFFPlayer
 
                 try
                 {
-                    // formatOptions にオプションをセット
-                    ffmpeg.av_dict_set(&formatOptions, "probesize", "512000", 0);
-                    ffmpeg.av_dict_set(&formatOptions, "analyzeduration", "1000000", 0); // 1秒
+                    // ストリーム解析のヒントとなるオプションを設定
+                    ffmpeg.av_dict_set(&formatOptions, "probesize", "512000", 0);             // バイト単位の解析サイズ
+                    ffmpeg.av_dict_set(&formatOptions, "analyzeduration", "1000000", 0);      // 解析最大時間（ミリセカンド）
 
-                    // ファイルを開く
+                    // 入力ファイルを開く
                     int ret = ffmpeg.avformat_open_input(&_formatContext, path, null, &formatOptions);
                     if (ret < 0)
-                    {
-                        throw new InvalidOperationException("指定のファイルは開けませんでした。");
-                    }
+                        throw new InvalidOperationException("指定されたファイルを開くことができません。");
 
-                    // 成功したので、formatContext に代入
                     formatContext = _formatContext;
 
-                    // FFmpeg の分析最大時間を指定（追加的に設定する場合）
-                    formatContext->max_analyze_duration = 1 * ffmpeg.AV_TIME_BASE;
+                    // ストリーム解析時間の上限設定（ミリセカンド単位）
+                    formatContext->max_analyze_duration = 1000000;
 
-                    // ストリーム情報の取得
+                    // ストリーム情報を解析
                     ret = ffmpeg.avformat_find_stream_info(formatContext, null);
                     if (ret < 0)
-                    {
-                        throw new InvalidOperationException("ストリームを検出できませんでした。");
-                    }
+                        throw new InvalidOperationException("ストリーム情報の取得に失敗しました。");
 
-                    // ストリーム情報を取得
+                    // 最初の映像・音声ストリームを取得
                     videoStream = GetFirstVideoStream();
                     audioStream = GetFirstAudioStream();
                 }
                 finally
                 {
-                    // formatOptions の解放（FFmpegが自動確保した内部構造を開放）
+                    // formatOptions のメモリを解放
                     ffmpeg.av_dict_free(&formatOptions);
                 }
             }
         }
 
-
+        /// <summary>
+        /// 映像・音声デコーダの初期化を行います。必要に応じてハードウェアデコードを使用します。
+        /// </summary>
+        /// <param name="forceD3D11">D3D11VAを強制するかどうか。</param>
         public unsafe void InitializeDecoders(bool forceD3D11 = false)
         {
             if (videoStream is not null && videoCodecContext == null)
             {
                 videoCodec = TryGetHardwareDecoder(videoStream->codecpar->codec_id, forceD3D11);
-
                 if (videoCodec == null)
-                    throw new InvalidOperationException("対応する動画デコーダが見つかりませんでした");
+                    throw new InvalidOperationException("対応する映像デコーダが見つかりません。");
 
                 videoCodecContext = ffmpeg.avcodec_alloc_context3(videoCodec);
                 if (videoCodecContext == null)
-                    throw new InvalidOperationException("動画コーデックコンテキストの確保に失敗しました");
+                    throw new InvalidOperationException("映像コーデックコンテキストの確保に失敗しました。");
 
                 ffmpeg.avcodec_parameters_to_context(videoCodecContext, videoStream->codecpar)
-                    .OnError(() => throw new InvalidOperationException("動画コーデックパラメータ設定失敗"));
+                    .OnError(() => throw new InvalidOperationException("映像コーデックパラメータの適用に失敗しました。"));
 
-                // ハードウェア使用判断
+                // ハードウェアデコーダの種類を判別
                 string? codecName = Marshal.PtrToStringAnsi((nint)videoCodec->name);
                 videoHardwareType = codecName switch
                 {
@@ -288,6 +248,7 @@ namespace CSharpFFPlayer
                     _ => null
                 };
 
+                // ハードウェアコンテキストの初期化
                 if (videoHardwareType is AVHWDeviceType hwType)
                 {
                     AVBufferRef* hw_device_ctx = null;
@@ -295,14 +256,15 @@ namespace CSharpFFPlayer
                     if (result >= 0)
                     {
                         videoCodecContext->hw_device_ctx = ffmpeg.av_buffer_ref(hw_device_ctx);
-                        Console.WriteLine($"✅ ハードウェアデコード使用中: {hwType}");
+                        Console.WriteLine($"ハードウェアデコード使用中: {hwType}");
                     }
                     else
                     {
+                        // 初期化失敗時はソフトウェアにフォールバック
                         var errbuf = stackalloc byte[1024];
                         ffmpeg.av_strerror(result, errbuf, 1024);
-                        Console.WriteLine($"⚠️ ハードウェアデバイス {hwType} の初期化に失敗: {Marshal.PtrToStringAnsi((nint)errbuf)}");
-                        Console.WriteLine("➡️ ソフトウェアにフォールバック");
+                        Console.WriteLine($"ハードウェアデバイス {hwType} の初期化に失敗: {Marshal.PtrToStringAnsi((nint)errbuf)}");
+                        Console.WriteLine("ソフトウェアデコードへ切り替えます。");
 
                         videoCodec = ffmpeg.avcodec_find_decoder(videoStream->codecpar->codec_id);
                         videoCodecContext = ffmpeg.avcodec_alloc_context3(videoCodec);
@@ -311,10 +273,11 @@ namespace CSharpFFPlayer
                     }
                 }
 
+                // デコーダ初期化（スレッド数の指定も可）
                 AVDictionary* options = null;
                 ffmpeg.av_dict_set(&options, "threads", "1", 0);
                 ffmpeg.avcodec_open2(videoCodecContext, videoCodec, &options)
-                    .OnError(() => throw new InvalidOperationException("動画デコーダ初期化失敗"));
+                    .OnError(() => throw new InvalidOperationException("映像デコーダの初期化に失敗しました。"));
                 ffmpeg.av_dict_free(&options);
             }
 
@@ -322,24 +285,22 @@ namespace CSharpFFPlayer
             {
                 audioCodec = ffmpeg.avcodec_find_decoder(audioStream->codecpar->codec_id);
                 if (audioCodec == null)
-                    throw new InvalidOperationException("音声コーデックが見つかりませんでした");
+                    throw new InvalidOperationException("対応する音声デコーダが見つかりません。");
 
                 audioCodecContext = ffmpeg.avcodec_alloc_context3(audioCodec);
                 if (audioCodecContext == null)
-                    throw new InvalidOperationException("音声コーデックコンテキストの確保に失敗しました");
+                    throw new InvalidOperationException("音声コーデックコンテキストの確保に失敗しました。");
 
                 ffmpeg.avcodec_parameters_to_context(audioCodecContext, audioStream->codecpar)
-                    .OnError(() => throw new InvalidOperationException("音声コーデックパラメータ設定失敗"));
+                    .OnError(() => throw new InvalidOperationException("音声コーデックパラメータの適用に失敗しました。"));
 
                 AVDictionary* options = null;
                 ffmpeg.av_dict_set(&options, "threads", "1", 0);
                 ffmpeg.avcodec_open2(audioCodecContext, audioCodec, &options)
-                    .OnError(() => throw new InvalidOperationException("音声デコーダ初期化失敗"));
+                    .OnError(() => throw new InvalidOperationException("音声デコーダの初期化に失敗しました。"));
                 ffmpeg.av_dict_free(&options);
             }
         }
-
-
 
 
         private AVStream* GetFirstVideoStream()
@@ -397,129 +358,134 @@ namespace CSharpFFPlayer
         {
             lock (sendPackedSyncObject)
             {
+                // ストリームとデコーダの対応を取得
+                AVCodecContext* targetCodecContext = null;
+                Queue<AVPacketPtr> targetPacketQueue = null;
+
                 if (index == videoStream->index)
                 {
-                    if (videoPackets.TryDequeue(out var ptr))
-                    {
-                        ffmpeg.avcodec_send_packet(videoCodecContext, ptr.Ptr)
-                            .OnError(() => throw new InvalidOperationException("動画デコーダへのパケットの送信に失敗しました。"));
-
-                        ptr.Dispose(); // ← 重要: Unref + Free
-                        return 0;
-                    }
+                    targetCodecContext = videoCodecContext;
+                    targetPacketQueue = videoPackets;
                 }
-
-                if (index == audioStream->index)
+                else if (index == audioStream->index)
                 {
-                    if (audioPackets.TryDequeue(out var ptr))
-                    {
-                        ffmpeg.avcodec_send_packet(audioCodecContext, ptr.Ptr)
-                            .OnError(() => throw new InvalidOperationException("音声デコーダへのパケットの送信に失敗しました。"));
-
-                        ptr.Dispose(); // ← 重要: Unref + Free
-                        return 0;
-                    }
+                    targetCodecContext = audioCodecContext;
+                    targetPacketQueue = audioPackets;
+                }
+                else
+                {
+                    throw new InvalidOperationException($"不明なストリームインデックス: {index}");
                 }
 
+                // 事前にキューにパケットがある場合はそれを送信
+                if (targetPacketQueue.TryDequeue(out var queuedPacket))
+                {
+                    int sendResult = ffmpeg.avcodec_send_packet(targetCodecContext, queuedPacket.Ptr);
+                    queuedPacket.Dispose(); // パケットの解放（Unref + Free）
+
+                    if (sendResult < 0)
+                        throw new InvalidOperationException("デコーダへのパケット送信に失敗しました。");
+
+                    return 0;
+                }
+
+                // パケット読み込みループ
                 while (true)
                 {
                     AVPacket packet = new AVPacket();
-                    var result = ffmpeg.av_read_frame(formatContext, &packet);
+                    int readResult = ffmpeg.av_read_frame(formatContext, &packet);
 
-                    if (result == 0)
+                    if (readResult < 0)
                     {
-                        if (packet.stream_index == videoStream->index)
-                        {
-                            if (packet.stream_index == index)
-                            {
-                                ffmpeg.avcodec_send_packet(videoCodecContext, &packet)
-                                    .OnError(() => throw new InvalidOperationException("動画デコーダへのパケットの送信に失敗しました。"));
-                                ffmpeg.av_packet_unref(&packet);
-                                return 0;
-                            }
-                            else
-                            {
-                                var cloned = ffmpeg.av_packet_clone(&packet);
-                                videoPackets.Enqueue(new AVPacketPtr(cloned));
-                                ffmpeg.av_packet_unref(&packet);
-                                continue;
-                            }
-                        }
-
-                        if (packet.stream_index == audioStream->index)
-                        {
-                            if (packet.stream_index == index)
-                            {
-                                ffmpeg.avcodec_send_packet(audioCodecContext, &packet)
-                                    .OnError(() => throw new InvalidOperationException("音声デコーダへのパケットの送信に失敗しました。"));
-                                ffmpeg.av_packet_unref(&packet);
-                                return 0;
-                            }
-                            else
-                            {
-                                var cloned = ffmpeg.av_packet_clone(&packet);
-                                audioPackets.Enqueue(new AVPacketPtr(cloned));
-                                ffmpeg.av_packet_unref(&packet);
-                                continue;
-                            }
-                        }
-
-                        ffmpeg.av_packet_unref(&packet); // ストリームに該当しない場合も忘れずに解放
-                    }
-                    else
-                    {
+                        // ストリーム終端、または読み込み失敗
                         return -1;
+                    }
+
+                    try
+                    {
+                        int streamIdx = packet.stream_index;
+
+                        if (streamIdx == videoStream->index || streamIdx == audioStream->index)
+                        {
+                            bool isTargetStream = (streamIdx == index);
+                            AVCodecContext* codecCtx = (streamIdx == videoStream->index) ? videoCodecContext : audioCodecContext;
+                            var packetQueue = (streamIdx == videoStream->index) ? videoPackets : audioPackets;
+
+                            if (isTargetStream)
+                            {
+                                int sendResult = ffmpeg.avcodec_send_packet(codecCtx, &packet);
+                                if (sendResult < 0)
+                                    throw new InvalidOperationException("デコーダへのパケット送信に失敗しました。");
+
+                                return 0;
+                            }
+                            else
+                            {
+                                AVPacket* cloned = ffmpeg.av_packet_clone(&packet);
+                                packetQueue.Enqueue(new AVPacketPtr(cloned));
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ffmpeg.av_packet_unref(&packet); // 処理対象外のストリーム or 処理済み
                     }
                 }
             }
         }
+
 
         public unsafe (FrameReadResult result, ManagedFrame frame) TryReadFrame()
         {
             var frame = TryReadUnsafeFrame(out var result);
 
-            if (result == FrameReadResult.FrameAvailable)
+            if (result != FrameReadResult.FrameAvailable)
             {
-                // GPUフレームだったらCPUに転送
-                var cpuFrame = TransferFrameToCPU(frame);
-                if (cpuFrame != frame)
-                {
-                    ffmpeg.av_frame_free(&frame); // 元のGPUフレームを解放
-                }
-
-                // NV12 → YUV420P へ変換
-                var yuv420Frame = ConvertToYUV420P(cpuFrame);
-                if (yuv420Frame != cpuFrame)
-                {
-                    ffmpeg.av_frame_free(&cpuFrame);
-                }
-
-                ulong mem = GetAVFrameMemoryUsage(yuv420Frame);
-                //Console.WriteLine($"[Frame] Format: {(AVPixelFormat)yuv420Frame->format}, Size: {yuv420Frame->width}x{yuv420Frame->height}, Memory: {mem / 1024.0 / 1024:F2} MB");
-                return (result, new ManagedFrame(yuv420Frame));
+                return (result, null);
             }
 
-            return (result, null);
-        }
+            // GPU上のフレームであれば、CPUに転送する
+            var cpuFrame = TransferFrameToCPU(frame);
+            if (cpuFrame != frame)
+            {
+                ffmpeg.av_frame_free(&frame);
+            }
 
+            // NV12など → YUV420Pへピクセルフォーマット変換
+            var yuv420Frame = ConvertToYUV420P(cpuFrame);
+            if (yuv420Frame != cpuFrame)
+            {
+                ffmpeg.av_frame_free(&cpuFrame);
+            }
+
+            ulong mem = GetAVFrameMemoryUsage(yuv420Frame);
+            // Console.WriteLine($"[Frame] Format: {(AVPixelFormat)yuv420Frame->format}, Size: {yuv420Frame->width}x{yuv420Frame->height}, Memory: {mem / 1024.0 / 1024:F2} MB");
+
+            return (result, new ManagedFrame(yuv420Frame));
+        }
 
         private unsafe AVFrame* TryReadUnsafeFrame(out FrameReadResult result)
         {
             AVFrame* frame = ffmpeg.av_frame_alloc();
 
+            // 試しに1回フレーム受信
             int receiveResult = ffmpeg.avcodec_receive_frame(videoCodecContext, frame);
+
+            // 受信に成功した場合
             if (receiveResult == 0)
             {
                 result = FrameReadResult.FrameAvailable;
                 return frame;
             }
 
+            // 入力不足（パケット供給が必要）
             if (receiveResult == FFmpegErrors.AVERROR_EAGAIN)
             {
-                // もっとパケットが必要
                 int sendResult = SendPacket(videoStream->index);
+
                 if (sendResult == 0)
                 {
+                    // 再度受信を試みる
                     receiveResult = ffmpeg.avcodec_receive_frame(videoCodecContext, frame);
                     if (receiveResult == 0)
                     {
@@ -527,9 +493,9 @@ namespace CSharpFFPlayer
                         return frame;
                     }
                 }
-                else if (sendResult == -1) // ← EOF（av_read_frame が失敗した）
+                else if (sendResult == -1) // ファイル終端
                 {
-                    // デコーダにnullパケットを送って EOF を通知
+                    // デコーダに空パケットを送りEOFを通知
                     ffmpeg.avcodec_send_packet(videoCodecContext, null);
 
                     receiveResult = ffmpeg.avcodec_receive_frame(videoCodecContext, frame);
@@ -547,6 +513,7 @@ namespace CSharpFFPlayer
                     }
                 }
 
+                // フレームはまだ利用不可
                 if (receiveResult == FFmpegErrors.AVERROR_EAGAIN)
                 {
                     ffmpeg.av_frame_free(&frame);
@@ -555,6 +522,7 @@ namespace CSharpFFPlayer
                 }
             }
 
+            // ストリーム終了
             if (receiveResult == ffmpeg.AVERROR_EOF)
             {
                 isVideoFrameEnded = true;
@@ -563,125 +531,136 @@ namespace CSharpFFPlayer
                 return null;
             }
 
+            // その他のエラー
             ffmpeg.av_frame_free(&frame);
             throw new Exception($"avcodec_receive_frame failed: {receiveResult}");
         }
 
 
+
         public static unsafe AVFrame* ConvertToYUV420P(AVFrame* src)
         {
             if ((AVPixelFormat)src->format == AVPixelFormat.AV_PIX_FMT_YUV420P)
-                return src; // すでに軽量形式なら変換しない
+                return src; // すでにYUV420P形式なら変換不要
 
             AVFrame* dst = ffmpeg.av_frame_alloc();
+            if (dst == null)
+                throw new Exception("出力フレームの確保に失敗しました。");
+
             dst->format = (int)AVPixelFormat.AV_PIX_FMT_YUV420P;
             dst->width = src->width;
             dst->height = src->height;
 
-            ffmpeg.av_frame_get_buffer(dst, 32).OnError(() =>
-                throw new Exception("出力フレームバッファ確保に失敗"));
+            if (ffmpeg.av_frame_get_buffer(dst, 32) < 0)
+            {
+                ffmpeg.av_frame_free(&dst);
+                throw new Exception("出力フレームバッファの確保に失敗しました。");
+            }
 
             SwsContext* sws = ffmpeg.sws_getContext(
                 src->width, src->height, (AVPixelFormat)src->format,
-                dst->width, dst->height, (AVPixelFormat)dst->format,
+                dst->width, dst->height, AVPixelFormat.AV_PIX_FMT_YUV420P,
                 1, null, null, null);
 
             if (sws == null)
-                throw new Exception("sws_getContext 失敗");
+            {
+                ffmpeg.av_frame_free(&dst);
+                throw new Exception("スケーラコンテキスト（sws_getContext）の作成に失敗しました。");
+            }
 
             ffmpeg.sws_scale(
                 sws, src->data, src->linesize, 0, src->height,
                 dst->data, dst->linesize);
 
             ffmpeg.sws_freeContext(sws);
-
             return dst;
         }
 
 
 
-        ulong GetAVFrameMemoryUsage(AVFrame* frame)
+
+        public static unsafe ulong GetAVFrameMemoryUsage(AVFrame* frame)
         {
             ulong totalSize = 0;
 
-            // 1. 実際の buf から
-            for (uint i = 0; i < 8; i++)
+            for (uint i = 0; i < ffmpeg.AV_NUM_DATA_POINTERS; i++)
             {
                 if (frame->buf[i] != null)
-                {
                     totalSize += frame->buf[i]->size;
-                }
             }
 
-            // 2. バッファがないときは推定値で
+            // バッファ情報がない場合は推定サイズを使う
             if (totalSize == 0)
             {
-                uint est = (uint)ffmpeg.av_image_get_buffer_size((AVPixelFormat)frame->format, frame->width, frame->height, 1);
-                if (est > 0)
-                    totalSize = est;
+                int estSize = ffmpeg.av_image_get_buffer_size(
+                    (AVPixelFormat)frame->format,
+                    frame->width,
+                    frame->height,
+                    1);
+
+                if (estSize > 0)
+                    totalSize = (ulong)estSize;
             }
 
             return totalSize;
         }
 
 
+
         /// <summary>
-        /// 次の音声フレームを読み取ります。動画の終端に達している場合は <c>null</c> が返されます。
+        /// 次の音声フレームを読み取って <see cref="ManagedFrame"/> に包んで返します。終端に達した場合は null を返します。
         /// </summary>
         public unsafe ManagedFrame ReadAudioFrame()
         {
             var frame = ReadUnsafeAudioFrame();
-            if (frame is null)
-            {
-                return null;
-            }
-            return new ManagedFrame(frame);
+            return frame == null ? null : new ManagedFrame(frame);
         }
+
+
 
         private bool isAudioFrameEnded;
 
         /// <summary>
-        /// 次の音声フレームを読み取ります。動画の終端に達している場合は <c>null</c> が返されます。
+        /// 次の音声フレームを読み取ります。呼び出し側が <see cref="ffmpeg.av_frame_free"/> によって解放する必要があります。
+        /// 終端に達した場合は null を返します。
         /// </summary>
-        /// <remarks>
-        /// 取得したフレームは <see cref="ffmpeg.av_frame_free(AVFrame**)"/> を呼び出して手動で解放する必要があることに注意してください。
-        /// </remarks>
-        /// <returns></returns>
         public unsafe AVFrame* ReadUnsafeAudioFrame()
         {
             AVFrame* frame = ffmpeg.av_frame_alloc();
+            if (frame == null)
+                throw new Exception("音声フレームの確保に失敗しました。");
 
             if (ffmpeg.avcodec_receive_frame(audioCodecContext, frame) == 0)
-            {
                 return frame;
-            }
 
             if (isAudioFrameEnded)
             {
-                ffmpeg.av_frame_free(&frame); // ← 解放追加
+                ffmpeg.av_frame_free(&frame);
                 return null;
             }
 
             while (SendPacket(audioStream->index) == 0)
             {
                 if (ffmpeg.avcodec_receive_frame(audioCodecContext, frame) == 0)
-                {
                     return frame;
-                }
             }
 
             isAudioFrameEnded = true;
-            ffmpeg.avcodec_send_packet(audioCodecContext, null)
-                .OnError(() => throw new InvalidOperationException("デコーダへのnullパケットの送信に失敗しました。"));
 
-            if (ffmpeg.avcodec_receive_frame(audioCodecContext, frame) == 0)
+            // デコーダに null パケットを送り終端を通知
+            if (ffmpeg.avcodec_send_packet(audioCodecContext, null) < 0)
             {
-                return frame;
+                ffmpeg.av_frame_free(&frame);
+                throw new InvalidOperationException("デコーダへの null パケット送信に失敗しました。");
             }
 
-            ffmpeg.av_frame_free(&frame); // ← 最後に解放
+            if (ffmpeg.avcodec_receive_frame(audioCodecContext, frame) == 0)
+                return frame;
+
+            ffmpeg.av_frame_free(&frame);
             return null;
         }
+
 
         ~Decoder()
         {
@@ -719,12 +698,12 @@ namespace CSharpFFPlayer
                 ffmpeg.avformat_close_input(&formatContext);
                 this.formatContext = null;
             }
-            
+
 
             isDisposed = true;
         }
 
-        
+
 
     }
 

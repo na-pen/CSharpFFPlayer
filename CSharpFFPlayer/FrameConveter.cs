@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 namespace CSharpFFPlayer
 {
     /// <summary>
-    /// フレームを変換する機能を提供します。
+    /// フレームを変換する機能を提供する。
     /// </summary>
     public unsafe class FrameConveter : IDisposable
     {
@@ -24,7 +24,7 @@ namespace CSharpFFPlayer
         private SwsContext* swsContext;
 
         /// <summary>
-        /// フレームの変換を設定します。
+        /// フレームの変換を設定する。
         /// </summary>
         /// <param name="srcFormat">変換元のフォーマット。</param>
         /// <param name="srcWidth">変換元の幅。</param>
@@ -63,7 +63,7 @@ namespace CSharpFFPlayer
         }
 
         /// <summary>
-        /// フレームを変換します。変換したフレームを指定したバッファに直接書き込みます。
+        /// フレームを変換する。変換したフレームを指定したバッファに直接書き込む。
         /// </summary>
         /// <param name="frame"></param>
         /// <returns></returns>
@@ -73,7 +73,7 @@ namespace CSharpFFPlayer
         }
 
         /// <summary>
-        /// フレームを変換します。変換したフレームを指定したバッファに直接書き込みます。
+        /// フレームを変換する。変換したフレームを指定したバッファに直接書き込む。
         /// </summary>
         /// <param name="frame"></param>
         /// <returns></returns>
@@ -83,7 +83,7 @@ namespace CSharpFFPlayer
         }
 
         /// <summary>
-        /// フレームを変換します。変換したフレームを指定したバッファに直接書き込みます。
+        /// フレームを変換する。変換したフレームを指定したバッファに直接書き込む。
         /// </summary>
         /// <param name="frame"></param>
         /// <returns></returns>
