@@ -33,17 +33,30 @@ namespace CSharpFFPlayer
         /// <param name="distWidth">変換先の幅。</param>
         /// <param name="distHeight">変換先の高さ。</param>
         public unsafe void Configure(int srcWidth, int srcHeight, AVPixelFormat srcFormat,
-                             int dstWidth, int dstHeight, AVPixelFormat dstFormat)
+                     int dstWidth, int dstHeight, AVPixelFormat dstFormat)
         {
+            if (srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0)
+                throw new InvalidOperationException("Configure に無効なサイズが渡されました。");
+
+            if (srcFormat == AVPixelFormat.AV_PIX_FMT_NONE || dstFormat == AVPixelFormat.AV_PIX_FMT_NONE)
+                throw new InvalidOperationException("無効なピクセルフォーマットが渡されました。");
+
+            if (srcFormat == AVPixelFormat.AV_PIX_FMT_D3D11 ||
+                srcFormat == AVPixelFormat.AV_PIX_FMT_QSV ||
+                srcFormat == AVPixelFormat.AV_PIX_FMT_CUDA ||
+                srcFormat == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD ||
+                srcFormat == AVPixelFormat.AV_PIX_FMT_VAAPI)
+                throw new InvalidOperationException("GPUフォーマットは直接 sws_getContext に使用できません。");
+
             this.srcWidth = srcWidth;
             this.srcHeight = srcHeight;
             this.srcFormat = srcFormat;
-            distWidth = dstWidth;
-            distHeight = dstHeight;
-            distFormat = dstFormat;
+            this.distWidth = dstWidth;
+            this.distHeight = dstHeight;
+            this.distFormat = dstFormat;
 
-            // 前のコンテキストを解放
             ffmpeg.sws_freeContext(swsContext);
+
             const int SWS_BICUBIC = 4;
 
             swsContext = ffmpeg.sws_getContext(
@@ -58,8 +71,13 @@ namespace CSharpFFPlayer
 
             if (swsContext == null)
             {
-                throw new InvalidOperationException("sws_getContext に失敗しました（対応していないピクセルフォーマット？）");
+                throw new InvalidOperationException("sws_getContext に失敗しました（対応していないピクセルフォーマットか、サイズが不正）");
             }
+        }
+        public int ExpectedBufferSize()
+        {
+            int bytesPerPixel = ffmpeg.av_get_bits_per_pixel(ffmpeg.av_pix_fmt_desc_get(distFormat)) / 8;
+            return distWidth * distHeight * bytesPerPixel;
         }
 
         /// <summary>

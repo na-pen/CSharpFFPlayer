@@ -206,6 +206,8 @@ namespace CSharpFFPlayer
                     ret = ffmpeg.avformat_find_stream_info(formatContext, null);
                     if (ret < 0)
                         throw new InvalidOperationException("ストリーム情報の取得に失敗しました。");
+                    // コンソールに詳細出力
+                    PrintMediaInfo(formatContext, path);
 
                     // 最初の映像・音声ストリームを取得
                     videoStream = GetFirstVideoStream();
@@ -217,6 +219,63 @@ namespace CSharpFFPlayer
                     ffmpeg.av_dict_free(&formatOptions);
                 }
             }
+        }
+
+        /// <summary>
+        /// AVFormatContext から動画/音声ストリームの情報を標準出力に出力します。
+        /// </summary>
+        /// <param name="formatContext">取得済みの AVFormatContext*</param>
+        /// <param name="path">入力ファイルのパス</param>
+        public static unsafe void PrintMediaInfo(AVFormatContext* formatContext, string path)
+        {
+            if (formatContext == null)
+            {
+                Console.WriteLine("AVFormatContext が null です。");
+                return;
+            }
+
+            Console.WriteLine($"--- メディア情報: {path} ---");
+
+            // 全体情報
+            double durationMs = formatContext->duration / (double)ffmpeg.AV_TIME_BASE * 1000;
+            Console.WriteLine($"再生時間: {durationMs:F0} ミリ秒");
+            Console.WriteLine($"ストリーム数: {formatContext->nb_streams}");
+            Console.WriteLine($"ビットレート: {formatContext->bit_rate} bps");
+
+            // 各ストリームの情報
+            for (int i = 0; i < formatContext->nb_streams; i++)
+            {
+                AVStream* stream = formatContext->streams[i];
+                AVCodecParameters* codecpar = stream->codecpar;
+                AVRational timeBase = stream->time_base;
+
+                if (codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_VIDEO)
+                {
+                    double fps = stream->r_frame_rate.den != 0
+                        ? stream->r_frame_rate.num / (double)stream->r_frame_rate.den
+                        : 0.0;
+
+                    Console.WriteLine($"\n[映像ストリーム #{i}]");
+                    Console.WriteLine($"  コーデック: {ffmpeg.avcodec_get_name(codecpar->codec_id)}");
+                    Console.WriteLine($"  解像度: {codecpar->width} x {codecpar->height}");
+                    Console.WriteLine($"  推定FPS: {fps:F3}");
+                    Console.WriteLine($"  タイムベース: {timeBase.num}/{timeBase.den}");
+                }
+                else if (codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_AUDIO)
+                {
+                    Console.WriteLine($"\n[音声ストリーム #{i}]");
+                    Console.WriteLine($"  コーデック: {ffmpeg.avcodec_get_name(codecpar->codec_id)}");
+                    Console.WriteLine($"  サンプルレート: {codecpar->sample_rate} Hz");
+                    Console.WriteLine($"  チャンネル数: {codecpar->ch_layout.nb_channels}");
+                    Console.WriteLine($"  タイムベース: {timeBase.num}/{timeBase.den}");
+                }
+                else
+                {
+                    Console.WriteLine($"\n[その他ストリーム #{i}] 種類: {codecpar->codec_type}");
+                }
+            }
+
+            Console.WriteLine($"--- メディア情報の出力完了 ---");
         }
 
         /// <summary>
@@ -444,6 +503,7 @@ namespace CSharpFFPlayer
                 return (result, null);
             }
 
+            /*
             // GPU上のフレームであれば、CPUに転送する
             var cpuFrame = TransferFrameToCPU(frame);
             if (cpuFrame != frame)
@@ -462,6 +522,8 @@ namespace CSharpFFPlayer
             // Console.WriteLine($"[Frame] Format: {(AVPixelFormat)yuv420Frame->format}, Size: {yuv420Frame->width}x{yuv420Frame->height}, Memory: {mem / 1024.0 / 1024:F2} MB");
 
             return (result, new ManagedFrame(yuv420Frame));
+            */
+            return (result, new ManagedFrame(frame));
         }
 
         private unsafe AVFrame* TryReadUnsafeFrame(out FrameReadResult result)
@@ -535,7 +597,6 @@ namespace CSharpFFPlayer
             ffmpeg.av_frame_free(&frame);
             throw new Exception($"avcodec_receive_frame failed: {receiveResult}");
         }
-
 
 
         public static unsafe AVFrame* ConvertToYUV420P(AVFrame* src)
