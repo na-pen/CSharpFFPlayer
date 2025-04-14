@@ -55,11 +55,13 @@ namespace CSharpFFPlayer
         /// 現在の AVFormatContext を取得します。
         /// </summary>
         public AVFormatContext FormatContext => *formatContext;
+        public AVFormatContext* FormatContextPointer => formatContext;
 
         /// <summary>
         /// 現在の動画ストリーム（AVStream）を取得します。
         /// </summary>
         public AVStream VideoStream => *videoStream;
+        public AVStream* VideoStreamPointer => videoStream;
 
         /// <summary>
         /// 現在の動画コーデック（AVCodec）を取得します。
@@ -70,16 +72,25 @@ namespace CSharpFFPlayer
         /// 現在の動画コーデックコンテキスト（AVCodecContext）を取得します。
         /// </summary>
         public AVCodecContext VideoCodecContext => *videoCodecContext;
+        public AVCodecContext* VideoCodecContextPointer => videoCodecContext;
 
         /// <summary>
         /// 現在の音声コーデックコンテキスト（AVCodecContext）を取得します。
         /// </summary>
         public AVCodecContext AudioCodecContext => *audioCodecContext;
+        public AVCodecContext* AudioCodecContextPointer => audioCodecContext;
 
         /// <summary>
         /// 映像ストリームが終端に達したかどうかを取得します。
         /// </summary>
         public bool IsVideoFrameEnded => isVideoFrameEnded;
+
+        /// <summary>
+        /// 現在の音声ストリーム（AVStream）を取得します。
+        /// </summary>
+        public AVStream AudioStream => *audioStream;
+
+        public AVStream* AudioStreamPointer => audioStream;
 
         private unsafe AVCodec* TryGetHardwareDecoder(AVCodecID codecId, bool forceD3D11 = false)
         {
@@ -502,27 +513,6 @@ namespace CSharpFFPlayer
             {
                 return (result, null);
             }
-
-            /*
-            // GPU上のフレームであれば、CPUに転送する
-            var cpuFrame = TransferFrameToCPU(frame);
-            if (cpuFrame != frame)
-            {
-                ffmpeg.av_frame_free(&frame);
-            }
-
-            // NV12など → YUV420Pへピクセルフォーマット変換
-            var yuv420Frame = ConvertToYUV420P(cpuFrame);
-            if (yuv420Frame != cpuFrame)
-            {
-                ffmpeg.av_frame_free(&cpuFrame);
-            }
-
-            ulong mem = GetAVFrameMemoryUsage(yuv420Frame);
-            // Console.WriteLine($"[Frame] Format: {(AVPixelFormat)yuv420Frame->format}, Size: {yuv420Frame->width}x{yuv420Frame->height}, Memory: {mem / 1024.0 / 1024:F2} MB");
-
-            return (result, new ManagedFrame(yuv420Frame));
-            */
             return (result, new ManagedFrame(frame));
         }
 
@@ -675,6 +665,90 @@ namespace CSharpFFPlayer
         {
             var frame = ReadUnsafeAudioFrame();
             return frame == null ? null : new ManagedFrame(frame);
+        }
+
+        /// <summary>
+        /// 次の音声フレームを読み取って <see cref="ManagedFrame"/> に包んで返します。
+        /// 読み取り状態を <see cref="FrameReadResult"/> で返します。
+        /// </summary>
+        public unsafe (FrameReadResult result, ManagedFrame frame) TryReadAudioFrame()
+        {
+            var frame = TryReadUnsafeAudioFrame(out var result);
+            return (result, frame == null ? null : new ManagedFrame(frame));
+        }
+
+        /// <summary>
+        /// 次の音声フレームを読み取ります。呼び出し側が <see cref="ffmpeg.av_frame_free"/> によって解放する必要があります。
+        /// 読み取り状態を <see cref="FrameReadResult"/> で返します。
+        /// </summary>
+        public unsafe AVFrame* TryReadUnsafeAudioFrame(out FrameReadResult result)
+        {
+            AVFrame* frame = ffmpeg.av_frame_alloc();
+            if (frame == null)
+                throw new Exception("音声フレームの確保に失敗しました。");
+
+            int receiveResult = ffmpeg.avcodec_receive_frame(audioCodecContext, frame);
+
+            if (receiveResult == 0)
+            {
+                result = FrameReadResult.FrameAvailable;
+                return frame;
+            }
+
+            // EAGAIN: 入力不足 → パケットを供給して再試行
+            if (receiveResult == FFmpegErrors.AVERROR_EAGAIN)
+            {
+                int sendResult = SendPacket(audioStream->index);
+
+                if (sendResult == 0)
+                {
+                    receiveResult = ffmpeg.avcodec_receive_frame(audioCodecContext, frame);
+                    if (receiveResult == 0)
+                    {
+                        result = FrameReadResult.FrameAvailable;
+                        return frame;
+                    }
+                }
+                else if (sendResult == -1) // ファイル終端
+                {
+                    // デコーダに null パケット送信で EOF 通知
+                    ffmpeg.avcodec_send_packet(audioCodecContext, null);
+
+                    receiveResult = ffmpeg.avcodec_receive_frame(audioCodecContext, frame);
+                    if (receiveResult == 0)
+                    {
+                        result = FrameReadResult.FrameAvailable;
+                        return frame;
+                    }
+                    else if (receiveResult == ffmpeg.AVERROR_EOF)
+                    {
+                        isAudioFrameEnded = true;
+                        ffmpeg.av_frame_free(&frame);
+                        result = FrameReadResult.EndOfStream;
+                        return null;
+                    }
+                }
+
+                // フレームはまだ利用不可
+                if (receiveResult == FFmpegErrors.AVERROR_EAGAIN)
+                {
+                    ffmpeg.av_frame_free(&frame);
+                    result = FrameReadResult.FrameNotReady;
+                    return null;
+                }
+            }
+
+            if (receiveResult == ffmpeg.AVERROR_EOF)
+            {
+                isAudioFrameEnded = true;
+                ffmpeg.av_frame_free(&frame);
+                result = FrameReadResult.EndOfStream;
+                return null;
+            }
+
+            // その他のエラー
+            ffmpeg.av_frame_free(&frame);
+            throw new Exception($"avcodec_receive_frame (Audio) failed: {receiveResult}");
         }
 
 

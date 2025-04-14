@@ -83,13 +83,60 @@ namespace CSharpFFPlayer
             throw new NotSupportedException($"Unsupported WaveFormat: {format.Encoding} {format.BitsPerSample}bit");
         }
 
+        private long playbackOffsetBytes = 0;
+
         /// <summary>
-        /// 現在の再生バイト位置を取得する（再生済みバイト数）
+        /// シーク直後などに呼び出して、現在の再生バイト数を基準として記録します。
+        /// </summary>
+        public void ResetPlaybackTime()
+        {
+            playbackOffsetBytes = output?.GetPosition() ?? 0;
+        }
+
+        /// <summary>
+        /// シークで任意の再生バイト位置にリセットする場合（手動オフセット指定）
+        /// </summary>
+        public void ResetPlaybackTime(long targetByteOffset)
+        {
+            playbackOffsetBytes = targetByteOffset;
+        }
+
+        /// <summary>
+        /// 現在の補正込み再生バイト数を返します（累積位置）
         /// </summary>
         public long GetPosition()
         {
-            return output?.GetPosition() ?? 0;
+            long current = output?.GetPosition() ?? 0;
+            return current - playbackOffsetBytes;
         }
+
+        /// <summary>
+        /// 現在の累積再生時間（TimeSpan）を返します。
+        /// </summary>
+        public TimeSpan GetPositionTime()
+        {
+            int bytesPerSec = AverageBytesPerSecond;
+            if (bytesPerSec <= 0) return TimeSpan.Zero;
+
+            return TimeSpan.FromSeconds((double)GetPosition() / bytesPerSec);
+        }
+
+        /// <summary>
+        /// 音声バッファをクリアし、再生位置オフセットもリセットします。
+        /// </summary>
+        public void ResetBuffer()
+        {
+            if (bufferedWaveProvider != null)
+            {
+                // 現在のバッファに格納されているサンプルを読み飛ばして削除
+                while (bufferedWaveProvider.BufferedBytes > 0)
+                {
+                    byte[] dummy = new byte[bufferedWaveProvider.BufferedBytes];
+                    bufferedWaveProvider.Read(dummy, 0, dummy.Length);
+                }
+            }
+        }
+
 
         /// <summary>
         /// 音声の再生を開始する

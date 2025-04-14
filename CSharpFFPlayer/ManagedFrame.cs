@@ -11,7 +11,7 @@ namespace CSharpFFPlayer
     {
         private AVFrame* frame;
         private bool isDisposed;
-
+        
         /// <summary>
         /// 指定された AVFrame をラップして管理します。
         /// </summary>
