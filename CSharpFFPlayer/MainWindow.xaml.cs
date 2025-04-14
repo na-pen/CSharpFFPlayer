@@ -144,21 +144,5 @@ namespace CSharpFFPlayer
         {
             _videoPlayController.Stop();
         }
-
-        /// <summary>
-        /// シークバーのドラッグ開始時に seeking フラグを立てる。
-        /// </summary>
-        private void SeekBar_PreviewMouseDown(object sender, MouseButtonEventArgs e)
-        {
-            _videoPlayController.isSeeking = true;
-        }
-
-        /// <summary>
-        /// シークバーのドラッグ終了時に seeking フラグを下ろす。
-        /// </summary>
-        private void SeekBar_PreviewMouseUp(object sender, MouseButtonEventArgs e)
-        {
-            _videoPlayController.isSeeking = false;
-        }
     }
 }

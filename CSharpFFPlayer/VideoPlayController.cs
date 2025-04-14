@@ -8,55 +8,59 @@ using System.Windows.Media;
 using FFmpeg.AutoGen;
 using NAudio.Wave;
 using System.Runtime.Intrinsics.X86;
+using System.Drawing.Imaging;
 
 namespace CSharpFFPlayer
 {
+    public enum PlaybackState
+    {
+        Stopped,
+        Playing,
+        Paused,
+        Buffering,
+        Seeking,
+        EndedStream,
+        Ended
+    }
+
     public class VideoPlayController
     {
+
         // FFmpeg で使用するピクセル形式（BGR24）
         private static readonly AVPixelFormat ffPixelFormat = AVPixelFormat.AV_PIX_FMT_BGR24;
 
         // WPF におけるピクセル形式（Bgr24）
-        private static readonly PixelFormat wpfPixelFormat = PixelFormats.Bgr24;
+        private static readonly System.Windows.Media.PixelFormat wpfPixelFormat = PixelFormats.Bgr24;
 
-        private TimeSpan pausedDuration = TimeSpan.Zero;
-        private DateTime pauseStartTime;
+        private PlaybackState playbackState = PlaybackState.Stopped;
+        public bool IsPlaying => playbackState == PlaybackState.Playing;
+        public bool IsPaused => playbackState == PlaybackState.Paused;
+        public bool IsSeeking => playbackState == PlaybackState.Seeking;
+        public bool IsBuffering => playbackState == PlaybackState.Buffering;
+        public bool IsEnded => playbackState == PlaybackState.Ended;
 
-        // 音声バッファ用ストリームとロック
         private MemoryStream audioStream = new MemoryStream();
         private readonly object audioLock = new object();
 
-        // 映像・音声のデコードや描画、変換処理関連
         private Decoder decoder;
         private ImageWriter imageWriter;
         private FrameConveter frameConveter;
 
-        // 再生状態の管理
-        private bool isPlaying = false;
-        private bool isPaused = false;
-        private bool isBuffering = false;
-        public bool isSeeking { get; set; } = false;
-        public bool IsPlaying => isPlaying;
-        public bool IsPaused => isPaused;
+        private const int frameCap = 100;
+        private const int waitTime = 150;
 
-        private bool isFrameEnded;
-        private const int frameCap = 100; // 最大フレームバッファ数
-        private const int waitTime = 150; // バッファ待機時間(ms)
-
-        private uint decodedFrames = 0; // デコード済みフレーム数
-
+        private uint decodedFrames = 0;
         private AVRational rawFps;
-        private double fps = 0; // フレームレート
-        private double baseFrameDurationMs = 0; // 1フレームあたりの表示時間（ミリ秒）
+        private double fps = 0;
+        private double baseFrameDurationMs = 0;
 
         private ConcurrentQueue<ManagedFrame> frames = new ConcurrentQueue<ManagedFrame>();
         private Task playTask;
 
         private AudioPlayer audioPlayer;
+        private int frameIndex = 0;
 
-        private bool isEndOfStream = false;
-
-        int frameIndex = 0;
+        private static readonly SemaphoreSlim decoderLock = new(1, 1);
 
         /// <summary>
         /// ファイルを開いて FFmpeg デコーダーを初期化
@@ -66,6 +70,7 @@ namespace CSharpFFPlayer
             decoder = new Decoder();
             decoder.OpenFile(path);
             decoder.InitializeDecoders(false);
+            playbackState = PlaybackState.Stopped;
         }
 
         /// <summary>
@@ -79,7 +84,6 @@ namespace CSharpFFPlayer
             ManagedFrame managedFrame = null;
             FrameReadResult result = FrameReadResult.FrameNotReady;
 
-            // フレーム取得（最大30回リトライ）
             for (int i = 0; i < 30; i++)
             {
                 (result, managedFrame) = decoder.TryReadFrame();
@@ -92,24 +96,19 @@ namespace CSharpFFPlayer
             if (result != FrameReadResult.FrameAvailable || managedFrame == null)
                 throw new InvalidOperationException("最初のフレームの取得に失敗しました。");
 
-            // ① CPUメモリに転送されたフレームを取得（必要に応じて転送される）
             managedFrame.GetCpuFrame();
 
-            // ② 解像度とピクセルフォーマットを取得
             AVFrame* frame = managedFrame.Frame;
             int width = frame->width;
             int height = frame->height;
             AVPixelFormat srcFormat = (AVPixelFormat)frame->format;
 
-            // ③ WPF用のWriteableBitmap作成
             WriteableBitmap writeableBitmap = new WriteableBitmap(width, height, dpiX, dpiY, wpfPixelFormat, null);
             imageWriter = new ImageWriter(width, height, writeableBitmap);
 
-            // ④ フレーム変換器を初期化（GPUフォーマットでないことを保証）
             frameConveter = new FrameConveter();
             frameConveter.Configure(width, height, srcFormat, width, height, ffPixelFormat);
 
-            // ⑤ 一時フレームを破棄
             managedFrame.Dispose();
 
             return writeableBitmap;
@@ -121,13 +120,14 @@ namespace CSharpFFPlayer
         /// </summary>
         public async Task Play()
         {
-            if (isPaused)
+            if (playbackState == PlaybackState.Paused)
             {
-                isPaused = false;
+                playbackState = PlaybackState.Playing;
+                audioPlayer?.Resume();
             }
             else
             {
-                isPlaying = true;
+                playbackState = PlaybackState.Playing;
                 audioPlayer = new AudioPlayer();
 
                 var waveFormat = new WaveFormat(decoder.AudioCodecContext.sample_rate, 16, decoder.AudioCodecContext.ch_layout.nb_channels);
@@ -135,7 +135,9 @@ namespace CSharpFFPlayer
 
                 playTask = PlayInternal();
             }
-            await playTask;
+
+            if (playTask != null)
+                await playTask;
         }
 
         /// <summary>
@@ -143,9 +145,11 @@ namespace CSharpFFPlayer
         /// </summary>
         public void Pause()
         {
-            isPaused = true;
-            audioPlayer?.Pause();
-            pauseStartTime = DateTime.Now;
+            if (playbackState.Equals(PlaybackState.Playing))
+            {
+                playbackState = PlaybackState.Paused;
+                audioPlayer?.Pause();
+            }
         }
 
         /// <summary>
@@ -153,19 +157,21 @@ namespace CSharpFFPlayer
         /// </summary>
         public void Stop()
         {
-            isPlaying = false;
-            isPaused = false;
+            playbackState = PlaybackState.Stopped;
 
             while (frames.TryDequeue(out var remainingFrame))
             {
                 remainingFrame.Dispose();
             }
+
             Console.WriteLine("再生を終了しました");
+
             frames.Clear();
             audioPlayer?.Dispose();
-            decoder.Dispose();
+            decoder?.Dispose();
             frameConveter?.Dispose();
         }
+
 
         public async Task<bool> SeekToExactFrameAsync(long targetFrameIndex)
         {
@@ -177,16 +183,17 @@ namespace CSharpFFPlayer
                     return false;
                 }
             }
+            audioPlayer.Pause();
+            playbackState = PlaybackState.Seeking;
 
-            // 再生状態リセット
-            isPlaying = false;
-            isPaused = true;
-            isBuffering = false;
-            isSeeking = true;
-            isFrameEnded = false;
-            isEndOfStream = false;
-            frames.Clear();
-
+            int disposedFrames = 0;
+            // 音声・映像のバッファクリア
+            while (frames.TryDequeue(out var oldFrame))
+            {
+                oldFrame.Dispose();
+                disposedFrames++;
+            }
+            Console.WriteLine($"Disposed {disposedFrames} frames.");
 
             audioPlayer?.ResetBuffer();
             lock (audioLock)
@@ -196,51 +203,43 @@ namespace CSharpFFPlayer
 
             var videoStream = decoder.VideoStream;
             AVRational videoTimeBase = videoStream.time_base;
-            AVRational videoFrameRate = videoStream.avg_frame_rate.num > 0 ? videoStream.avg_frame_rate : new AVRational { num = 1, den = (int)Math.Round(fps) };
+            AVRational videoFrameRate = videoStream.avg_frame_rate.num > 0
+                ? videoStream.avg_frame_rate
+                : new AVRational { num = 1, den = (int)Math.Round(fps) };
 
-            long targetPts = ffmpeg.av_rescale_q(
-                targetFrameIndex,
-                videoFrameRate,
-                videoTimeBase
-            );
+            long targetPts = ffmpeg.av_rescale_q(targetFrameIndex, videoFrameRate, videoTimeBase);
 
-            int result = -1;
 
-            // 映像ストリームに対してシーク
+            // シークおよびフラッシュ処理を排他制御
+            await decoderLock.WaitAsync();
             unsafe
             {
-                result = ffmpeg.avformat_seek_file(
-    decoder.FormatContextPointer,
-    videoStream.index,
-    long.MinValue,
-    targetPts,
-    targetPts,
-    ffmpeg.AVSEEK_FLAG_BACKWARD
-);
-            }
-
-            if (result < 0)
-            {
-                Console.WriteLine($"[エラー] 映像PTS {targetPts} フレーム{targetFrameIndex} へのシークに失敗しました");
-                return false;
-            }
-
-            // コーデックバッファのフラッシュ（映像・音声ともに）
-            unsafe
-            {
-                if (decoder.VideoCodecContextPointer != null)
+                try
                 {
+                    int result = ffmpeg.av_seek_frame(
+                        decoder.FormatContextPointer,
+                        videoStream.index,
+                        targetPts,
+                        ffmpeg.AVSEEK_FLAG_BACKWARD
+                    );
+
+                    if (result < 0)
+                    {
+                        Console.WriteLine($"[エラー] 映像PTS {targetPts} フレーム{targetFrameIndex} へのシークに失敗しました");
+                        playbackState = PlaybackState.Paused;
+                        return false;
+                    }
+
                     ffmpeg.avcodec_flush_buffers(decoder.VideoCodecContextPointer);
+                    if (decoder.AudioCodecContextPointer != null)
+                        ffmpeg.avcodec_flush_buffers(decoder.AudioCodecContextPointer);
                 }
-
-                if (decoder.AudioCodecContextPointer != null)
+                finally
                 {
-                    ffmpeg.avcodec_flush_buffers(decoder.AudioCodecContextPointer);
+                    decoderLock.Release();
                 }
             }
-
-
-            // ==== フレームの読み飛ばし ====
+            // ==== フレーム読み飛ばし ====
             const int maxSkip = 1000;
             int skipped = 0;
             ManagedFrame matchedFrame = null;
@@ -252,8 +251,17 @@ namespace CSharpFFPlayer
 
                 for (int i = 0; i < 30; i++)
                 {
-                    (readResult, frame) = decoder.TryReadFrame();
-                    if (readResult == FrameReadResult.FrameAvailable)
+                    await decoderLock.WaitAsync();
+                    try
+                    {
+                        (readResult, frame) = decoder.TryReadFrame();
+                    }
+                    finally
+                    {
+                        decoderLock.Release();
+                    }
+
+                    if (readResult == FrameReadResult.FrameAvailable || readResult == FrameReadResult.EndOfStream)
                         break;
 
                     await Task.Delay(10);
@@ -262,6 +270,7 @@ namespace CSharpFFPlayer
                 if (readResult == FrameReadResult.EndOfStream)
                 {
                     Console.WriteLine("[シーク失敗] ストリーム終端に達しました");
+                    playbackState = PlaybackState.Paused;
                     return false;
                 }
 
@@ -288,6 +297,7 @@ namespace CSharpFFPlayer
             if (matchedFrame == null)
             {
                 Console.WriteLine("[シーク失敗] 指定されたフレームに到達できませんでした");
+                playbackState = PlaybackState.Paused;
                 return false;
             }
 
@@ -295,52 +305,61 @@ namespace CSharpFFPlayer
             frameIndex = (int)GetFrameIndex(matchedFrame);
             Console.WriteLine($"[シークインキュー] フレーム番号: {frameIndex}");
 
-            unsafe
+
+            // ==== 音声シーク処理 ====
+            await decoderLock.WaitAsync();
+            try
             {
-                // ==== 音声のシーク ====
-                if (decoder.AudioStreamPointer != null)
+                unsafe
                 {
-                    AVRational audioTimeBase = decoder.AudioStream.time_base;
-                    long audioPts = ffmpeg.av_rescale_q(
-                        targetFrameIndex,
-                        videoFrameRate,
-                        audioTimeBase
-                    );
-
-                    int audioResult = ffmpeg.av_seek_frame(
-                        decoder.FormatContextPointer,
-                        decoder.AudioStream.index,
-                        audioPts,
-                        ffmpeg.AVSEEK_FLAG_BACKWARD | ffmpeg.AVSEEK_FLAG_ANY
-                    );
-
-                    if (audioResult >= 0)
+                    if (decoder.AudioStreamPointer != null)
                     {
-                        ffmpeg.avcodec_flush_buffers(decoder.AudioCodecContextPointer);
-                        Console.WriteLine($"[Audioシーク] 音声PTS {audioPts} にシーク成功");
+                        AVStream* audioStream = decoder.AudioStreamPointer;
+                        AVRational audioTimeBase = audioStream->time_base;
 
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[警告] 音声PTS {audioPts} へのシークに失敗しました");
+                        long audioPts = ffmpeg.av_rescale_q(
+                            targetFrameIndex,
+                            videoFrameRate,
+                            audioTimeBase
+                        );
+
+                        int audioResult = ffmpeg.av_seek_frame(
+                            decoder.FormatContextPointer,
+                            audioStream->index,
+                            audioPts,
+                            ffmpeg.AVSEEK_FLAG_BACKWARD | ffmpeg.AVSEEK_FLAG_ANY
+                        );
+
+                        if (audioResult >= 0)
+                        {
+                            ffmpeg.avcodec_flush_buffers(decoder.AudioCodecContextPointer);
+                            Console.WriteLine($"[Audioシーク] 音声PTS {audioPts} にシーク成功");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[警告] 音声PTS {audioPts} へのシークに失敗しました");
+                        }
                     }
                 }
             }
-
+            finally
+            {
+                decoderLock.Release();
+            }
+            // 音声再生位置リセット
             audioPlayer?.ResetPlaybackTime();
+            // 再生準備完了
+            playbackState = PlaybackState.Paused;
+
+            // バッファ回復と読み込み再開（内部処理へ統合）
+            _ = Task.Run(() => ReadFrames());
             _ = Task.Run(() => ReadAudioFrames());
             await WaitForBuffer();
+            
+            Console.WriteLine($"[シーク完了] フレーム {targetFrameIndex}（実際: {frameIndex}）{frames.Count} に移動しました");
 
-            // 再生再開
-            isSeeking = false;
-            isPaused = false;
-
-            Console.WriteLine($"[シーク完了] フレーム {targetFrameIndex}（実際: {frameIndex}） に移動しました");
             return true;
         }
-
-
-
 
 
 
@@ -350,22 +369,18 @@ namespace CSharpFFPlayer
         /// </summary>
         private async Task PlayInternal()
         {
-            // フレームと音声のデコードを並列で開始
             _ = Task.Run(() => ReadFrames());
             _ = Task.Run(() => ReadAudioFrames());
 
-            // バッファが一定量たまるまで待機
             await WaitForBuffer();
 
-            // フレームレートの計算（1000/33 の場合のみ補正→Windowsのエンコードエラーの模様）
             rawFps = decoder.VideoStream.avg_frame_rate;
             fps = (rawFps.num == 1000 && rawFps.den == 33) ? 29.97 : rawFps.num / (double)rawFps.den;
             baseFrameDurationMs = 1000.0 / fps;
             TimeSpan frameDuration = TimeSpan.FromMilliseconds(baseFrameDurationMs);
 
-            isFrameEnded = false;
+            playbackState = PlaybackState.Playing;
             bool resumed = false;
-
             DateTime playbackStartTime = DateTime.Now;
             Queue<double> boostHistory = new();
 
@@ -373,31 +388,31 @@ namespace CSharpFFPlayer
 
             var stopwatch = new Stopwatch();
 
-            while (isPlaying)
+            while (playbackState != PlaybackState.Stopped && playbackState != PlaybackState.Ended)
             {
-                // 映像バッファが不足 → 自動一時停止
-                if (!isBuffering && frames.Count < frameCap / 4 && !isFrameEnded)
+                // バッファ不足 → 自動一時停止
+                if (playbackState == PlaybackState.Playing && frames.Count < frameCap / 4)
                 {
-                    isBuffering = true;
+                    playbackState = PlaybackState.Buffering;
                     audioPlayer?.Pause();
                 }
 
-                // 映像バッファが回復 → 自動再開
-                if (isBuffering && frames.Count >= frameCap / 1.2)
+                // バッファ回復 → 自動再開
+                if (playbackState == PlaybackState.Buffering && frames.Count >= frameCap / 1.2)
                 {
-                    isBuffering = false;
-                    audioPlayer?.Resume();
+                    playbackState = PlaybackState.Playing;
+                    //audioPlayer?.Resume();
                 }
 
-                // 明示的な一時停止またはバッファ待機中
-                if (isPaused || isBuffering)
+                // 一時停止・バッファ中などで待機
+                if (playbackState == PlaybackState.Paused || playbackState == PlaybackState.Buffering || playbackState == PlaybackState.Seeking)
                 {
                     resumed = false;
-                    await Task.Delay(isPaused ? 150 : 100);
+                    await Task.Delay(playbackState == PlaybackState.Paused ? 150 : 100);
                     continue;
                 }
 
-                // 再開直後：現在の音声位置にフレームを同期
+                // 再開直後は音声位置に合わせて同期
                 if (!resumed)
                 {
                     var position = TimeSpan.FromSeconds((double)audioPlayer.GetPosition() / audioPlayer.AverageBytesPerSecond);
@@ -412,31 +427,28 @@ namespace CSharpFFPlayer
                     playbackStartTime = DateTime.Now - position;
                 }
 
-
-                // 次のフレームを描画
                 if (frames.TryDequeue(out var frame))
                 {
-
+                    unsafe
+                    {
+                        if (frame.Frame == null || frame.Frame->buf[0] == null)
+                        {
+                            Console.WriteLine("[警告] デコードされたフレームにバッファが存在しません。破棄します");
+                            frame.Dispose();
+                            continue;
+                        }
+                    }
+                    
+                    // 自動シーク条件（例：frameIndex == 400 でループ再生）
                     if (frameIndex == 400)
                     {
-                        isPlaying = false;
-                        isPaused = true;
-
                         await SeekToExactFrameAsync(0);
 
-                        audioPlayer?.Pause();
-                        lock (audioLock)
-                        {
-                            audioStream.SetLength(0);
-                        }
 
-                        isPlaying = true;
-                        isPaused = false;
-                        _ = Task.Run(() => ReadFrames());
-                        _ = Task.Run(() => ReadAudioFrames());
+                        //playbackState = PlaybackState.Playing;
                         continue;
                     }
-                    // GPUフレームが未転送で残っていた場合 → スキップ（エラー防止）
+
                     if (frame.IsGpuFrame)
                     {
                         Console.WriteLine("[描画スキップ] GPU未転送フレームをスキップしました");
@@ -458,31 +470,30 @@ namespace CSharpFFPlayer
                     {
                         frameIndex++;
                     }
+
                     frame.Dispose();
-
-
                     stopwatch.Stop();
                 }
                 else
                 {
-                    if (isFrameEnded)
+                    if (playbackState == PlaybackState.Ended)
                     {
                         Stop();
                         return;
                     }
 
-                    await Task.Delay(30); // 復帰高速化
+                    await Task.Delay(30);
                     continue;
                 }
 
-                // バッファ過多 → 古いフレームを破棄
+                // フレームバッファの整理
                 while (frames.Count > frameCap && frames.TryDequeue(out var old))
                 {
                     old.Dispose();
                     frameIndex++;
                 }
 
-                // 同期補正処理
+                // ==== 音声との同期補正 ====
                 var audioPos = TimeSpan.FromSeconds((double)audioPlayer.GetPosition() / audioPlayer.AverageBytesPerSecond);
                 var (idealFrameIndex, timeInFrame2) = GetCurrentFrameInfo(fps, audioPos);
                 int frameDiff = idealFrameIndex - frameIndex;
@@ -504,7 +515,6 @@ namespace CSharpFFPlayer
 
                         Console.WriteLine($"[スキップ] {skip}フレーム, 差: {frameDiff}, 時刻差: {timeInFrame2.TotalMilliseconds:F2}ms");
 
-                        // 再計算
                         frameDiff = idealFrameIndex - frameIndex;
                         offsetMs = timeInFrame2.TotalMilliseconds + frameDiff * baseFrameDurationMs;
                     }
@@ -513,7 +523,7 @@ namespace CSharpFFPlayer
                         double delayMs = (-offsetMs) * 1.3;
                         adjustedDelayMs = baseFrameDurationMs + delayMs;
 
-                        Console.WriteLine($"[待機] 想定されるフレーム: {idealFrameIndex}, 実際のフレーム: {frameIndex}, 差: {frameDiff}, 時刻差: {timeInFrame2.TotalMilliseconds:F2}ms, 遅延: {delayMs:F2}ms");
+                        Console.WriteLine($"[待機] 想定: {idealFrameIndex}, 実際: {frameIndex}, 差: {frameDiff}, 遅延: {delayMs:F2}ms");
                     }
                     else if (frameDiff > 0)
                     {
@@ -527,13 +537,13 @@ namespace CSharpFFPlayer
                     }
                 }
 
-                // 実描画時間を除いて残り時間だけ待機
+                // 描画処理にかかった時間を除いて残り待機
                 long used = stopwatch.ElapsedMilliseconds;
                 int remaining = Math.Max(1, (int)(adjustedDelayMs - used));
                 await Task.Delay(remaining);
             }
-
         }
+
 
 
         /// <summary>
@@ -548,14 +558,23 @@ namespace CSharpFFPlayer
             return (frameNumber, TimeSpan.FromMilliseconds(timeInFrame));
         }
 
+        /// <summary>
+        /// フレームのPTSからフレームインデックスを計算
+        /// </summary>
         public unsafe long? GetFrameIndex(ManagedFrame frame)
         {
-            AVRational timeBase = decoder.VideoStream.time_base;
             if (frame.Frame->pts == ffmpeg.AV_NOPTS_VALUE)
                 return null;
 
-            // PTSを秒単位に変換 → fpsで掛けてフレーム番号に換算
-            long frameIndex = ffmpeg.av_rescale_q(frame.Frame->pts, timeBase, new AVRational { num = (int)rawFps.den, den = rawFps.num });
+            AVRational timeBase = decoder.VideoStream.time_base;
+            AVRational frameRate = rawFps;
+
+            long frameIndex = ffmpeg.av_rescale_q(
+                frame.Frame->pts,
+                timeBase,
+                new AVRational { num = frameRate.den, den = frameRate.num } // ← 秒単位に変換 → フレームに換算
+            );
+
             return frameIndex;
         }
 
@@ -564,9 +583,12 @@ namespace CSharpFFPlayer
         /// </summary>
         private async Task WaitForBuffer()
         {
-            while (frames.Count < frameCap && isPlaying)
+            while (frames.Count < frameCap && playbackState == PlaybackState.Playing || playbackState == PlaybackState.Paused)
+            {
                 await Task.Delay(waitTime);
+            }
         }
+
 
         private static readonly SemaphoreSlim transferLimiter = new(4); // 同時転送制限
 
@@ -577,23 +599,35 @@ namespace CSharpFFPlayer
         {
             int transferredCount = 0;
             int totalFramesToTransfer = 0;
+            const int preTransferThreshold = 10;
 
-            while (isPlaying)
+            while (playbackState != PlaybackState.Stopped && playbackState != PlaybackState.Ended && playbackState != PlaybackState.Seeking)
             {
-                // キューの上限に達している場合は少し待機してスキップ
                 if (frames.Count >= frameCap)
                 {
                     await Task.Delay(1);
                     continue;
                 }
 
+                FrameReadResult result;
+                ManagedFrame frame = null;
                 var sw = Stopwatch.StartNew();
-                var (result, frame) = decoder.TryReadFrame();
-                sw.Stop();
+
+                // ==== FFmpeg に対する読み取りを排他制御 ====
+                await decoderLock.WaitAsync();
+                try
+                {
+                    (result, frame) = decoder.TryReadFrame();
+                }
+                finally
+                {
+                    decoderLock.Release();
+                    sw.Stop();
+                }
 
                 if (result == FrameReadResult.FrameAvailable)
                 {
-                    if (!isPlaying)
+                    if (playbackState == PlaybackState.Stopped)
                     {
                         frame.Dispose();
                         return;
@@ -601,7 +635,7 @@ namespace CSharpFFPlayer
 
                     frames.Enqueue(frame);
                     decodedFrames++;
-                    Interlocked.Increment(ref totalFramesToTransfer); // デコード済みフレーム数カウント
+                    Interlocked.Increment(ref totalFramesToTransfer);
 
                     if (sw.ElapsedMilliseconds > baseFrameDurationMs && fps != 0.0)
                     {
@@ -612,28 +646,22 @@ namespace CSharpFFPlayer
                 {
                     await Task.Delay(1);
                 }
-                else if (result == FrameReadResult.EndOfStream)
-                {
-                }
 
-                // 転送処理（frameCapが十分ある時は非同期、少ないときは即時）
-
-                const int preTransferThreshold = 10;
-                int threshold = Math.Min(preTransferThreshold, frames.Count);
-                bool prevIsFrameEnded = isFrameEnded;
-                isFrameEnded = result == FrameReadResult.EndOfStream;
-                if (!prevIsFrameEnded && isFrameEnded)
+                if (result == FrameReadResult.EndOfStream && !playbackState.Equals(PlaybackState.EndedStream))
                 {
                     Console.WriteLine("[EOF] 映像ストリームの終端を検出しました");
+                    playbackState = PlaybackState.EndedStream;
                 }
+
+                // ==== 転送処理 ====
+                int threshold = Math.Min(preTransferThreshold, frames.Count);
 
                 foreach (var f in frames.Take(threshold))
                 {
-                    if (!f.IsGpuFrame) continue; // すでに転送済み
+                    if (!f.IsGpuFrame) continue;
 
                     if (frames.Count > preTransferThreshold)
                     {
-                        // バッファが安定 → 非同期転送
                         _ = Task.Run(async () =>
                         {
                             await transferLimiter.WaitAsync();
@@ -654,7 +682,6 @@ namespace CSharpFFPlayer
                     }
                     else
                     {
-                        // バッファ不足時 → 即時同期転送
                         try
                         {
                             unsafe { f.GetCpuFrame(); }
@@ -667,18 +694,15 @@ namespace CSharpFFPlayer
                     }
                 }
 
-                // 転送終了判定：バッファ少量＋EOF受信＋全転送完了時のみ終了
                 if (frames.Count < preTransferThreshold &&
-                    isEndOfStream &&
+                    playbackState == PlaybackState.EndedStream &&
                     Volatile.Read(ref transferredCount) >= Volatile.Read(ref totalFramesToTransfer))
                 {
                     Console.WriteLine("映像フレームの終端（すべて転送済み）");
+                    playbackState = PlaybackState.Ended;
                     return;
                 }
 
-
-
-                // 高負荷緩和のための軽いスローダウン
                 if (frames.Count > frameCap * 0.8)
                 {
                     await Task.Delay(1);
@@ -690,53 +714,72 @@ namespace CSharpFFPlayer
 
 
 
+
+
         /// <summary>
         /// 非同期に音声フレームを読み取り、AudioPlayer に供給する
         /// </summary>
         private async Task ReadAudioFrames()
         {
-            const int maxRetry = 100; // 最大リトライ回数（例: 100回）
+            const int maxRetry = 100;
             const int retryDelayMs = 10;
             int retryCount = 0;
 
-            while (isPlaying)
+            while (playbackState != PlaybackState.Stopped && playbackState != PlaybackState.Ended)
             {
-                if (isPaused)
+                // 一時停止中などの場合は一時待機
+                if (playbackState == PlaybackState.Paused || playbackState == PlaybackState.Buffering || playbackState == PlaybackState.Seeking)
                 {
                     await Task.Delay(100);
                     continue;
                 }
 
+                // バッファが十分な場合は一時待機（最大10秒分）
                 if (audioPlayer.BufferedDuration.TotalSeconds >= 10)
                 {
                     await Task.Delay(100);
+                    continue;
                 }
-                else
+
+                var (result, audioFrame) = decoder.TryReadAudioFrame();
+
+                switch (result)
                 {
-                    var (result, audioFrame) = decoder.TryReadAudioFrame();
-
-                    switch (result)
-                    {
-                        case FrameReadResult.FrameAvailable:
-                            using (var audioData = AudioFrameConveter.ConvertTo<PCMInt16Format>(audioFrame))
+                    case FrameReadResult.FrameAvailable:
+                        unsafe
+                        {
+                            if (audioFrame.Frame == null || audioFrame.Frame->nb_samples <= 0)
                             {
-                                byte[] data = audioData.AsMemory().ToArray();
-                                audioPlayer.AddAudioData(data);
+                                Console.WriteLine("[Audio] 無効なフレームが読み込まれました（nb_samples <= 0）");
+                                audioFrame.Dispose();
+                                return;
                             }
-                            audioFrame.Dispose();
-                            break;
+                        }
+                        using (var audioData = AudioFrameConveter.ConvertTo<PCMInt16Format>(audioFrame))
+                        {
+                            byte[] data = audioData.AsMemory().ToArray();
+                            audioPlayer.AddAudioData(data);
+                        }
+                        audioFrame.Dispose();
+                        break;
 
-                        case FrameReadResult.FrameNotReady:
-                            await Task.Delay(10);
-                            break;
-
-                        case FrameReadResult.EndOfStream:
-                            Console.WriteLine("[Audio] End of stream reached.");
+                    case FrameReadResult.FrameNotReady:
+                        await Task.Delay(retryDelayMs);
+                        retryCount++;
+                        if (retryCount > maxRetry)
+                        {
+                            Console.WriteLine("[Audio] フレーム取得リトライ上限に達しました。");
                             return;
-                    }
+                        }
+                        break;
+
+                    case FrameReadResult.EndOfStream:
+                        Console.WriteLine("[Audio] End of stream reached.");
+                        return;
                 }
             }
         }
+
 
     }
 }

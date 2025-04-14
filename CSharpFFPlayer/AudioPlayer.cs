@@ -164,7 +164,7 @@ namespace CSharpFFPlayer
         /// </summary>
         public void Pause()
         {
-            if (output?.PlaybackState == PlaybackState.Playing)
+            if (output?.PlaybackState == NAudio.Wave.PlaybackState.Playing)
             {
                 try
                 {
@@ -182,7 +182,7 @@ namespace CSharpFFPlayer
         /// </summary>
         public void Resume()
         {
-            if (output?.PlaybackState == PlaybackState.Paused)
+            if (output?.PlaybackState == NAudio.Wave.PlaybackState.Paused)
             {
                 try
                 {
