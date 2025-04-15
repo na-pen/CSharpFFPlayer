@@ -203,6 +203,7 @@ namespace CSharpFFPlayer
 
                 audioPlayer.Pause(true);
                 playbackState = PlaybackState.Seeking;
+                targetFrameIndex = (targetFrameIndex <= 0) ? 1 : targetFrameIndex ;
 
                 var videoStream = decoder.VideoStream;
                 AVRational videoTimeBase = videoStream.time_base;
@@ -502,7 +503,11 @@ namespace CSharpFFPlayer
                 fps = 29.97;
             }
             else
+            { 
                 videoFps = rawFps;
+                fps = (double)videoFps.num / (double)videoFps.den;
+                fps = (double)videoFps.num / (double)videoFps.den;
+            }
             baseFrameDurationMs = 1000.0 / fps;
             TimeSpan frameDuration = TimeSpan.FromMilliseconds(baseFrameDurationMs);
 
