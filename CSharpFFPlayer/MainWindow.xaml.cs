@@ -108,6 +108,9 @@ namespace CSharpFFPlayer
             _writeableBitmap = _videoPlayController.CreateBitmap(dpiX, dpiY);
             VideoImage.Source = _writeableBitmap;
 
+
+            _ = UpdateSeekSliderLoopAsync();
+
             // 動画再生を開始
             await _videoPlayController.Play();
         }
@@ -137,6 +140,7 @@ namespace CSharpFFPlayer
             }
         }
 
+
         /// <summary>
         /// 停止ボタンのクリックイベントで動画を停止。
         /// </summary>
@@ -145,20 +149,57 @@ namespace CSharpFFPlayer
             _videoPlayController.Stop();
         }
 
-        /// <summary>
-        /// シークバーのドラッグ開始時に seeking フラグを立てる。
-        /// </summary>
-        private void SeekBar_PreviewMouseDown(object sender, MouseButtonEventArgs e)
+        private bool isDraggingSlider = false;
+        private bool isUpdatingSlider = false;
+
+        private void SeekSlider_PreviewMouseDown(object sender, MouseButtonEventArgs e)
         {
-            _videoPlayController.isSeeking = true;
+            isDraggingSlider = true;
+            //_videoPlayController.Pause(); // 一時停止
         }
 
-        /// <summary>
-        /// シークバーのドラッグ終了時に seeking フラグを下ろす。
-        /// </summary>
-        private void SeekBar_PreviewMouseUp(object sender, MouseButtonEventArgs e)
+        private async void SeekSlider_PreviewMouseUp(object sender, MouseButtonEventArgs e)
         {
-            _videoPlayController.isSeeking = false;
+            isDraggingSlider = false;
+
+            long targetFrame = (long)SeekSlider.Value;
+            Console.WriteLine($"{targetFrame}");
+            bool success = await _videoPlayController.SeekToExactFrameAsync(targetFrame);
+
+            if (success)
+            {
+                Console.WriteLine($"[シークバー] フレーム {targetFrame} にシーク成功");
+            }
+            else
+            {
+                Console.WriteLine($"[シークバー] シーク失敗");
+            }
+        }
+
+        private async Task UpdateSeekSliderLoopAsync()
+        {
+            isUpdatingSlider = true;
+            SeekSlider.Minimum = 0;
+
+            while (isUpdatingSlider)
+            {
+                long totalFrames = _videoPlayController.GetTotalFrameCount();
+                SeekSlider.Maximum = totalFrames;
+
+                if (!isDraggingSlider && _videoPlayController.IsPlaying)
+                {
+                    // 現在のフレーム位置を取得してスライダーに反映
+                    long currentFrame = _videoPlayController.FrameIndex;
+
+                    // UIスレッドで操作（念のため Dispatcher 使用）
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        SeekSlider.Value = currentFrame;
+                    });
+                }
+
+                await Task.Delay(100); // 100msごとに更新
+            }
         }
     }
 }

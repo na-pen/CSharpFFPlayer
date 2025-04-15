@@ -173,18 +173,36 @@ namespace CSharpFFPlayer
         {
             lock (transferLock)
             {
-                if (isDisposed)
-                    return;
+                if (isDisposed) return;
 
+                // 二重解放防止
                 if (frame != null)
                 {
-                    AVFrame* temp = frame;
-                    ffmpeg.av_frame_free(&temp);
-                    frame = null;
+                    try
+                    {
+                        // 明示的に固定して解放
+                        fixed (AVFrame** framePtr = &frame)
+                        {
+                            ffmpeg.av_frame_free(framePtr);
+                        }
+
+                        frame = null;
+                    }
+                    catch (AccessViolationException ex)
+                    {
+                        Console.WriteLine($"[Dispose Error] AVFrame 解放中にアクセス違反: {ex.Message}");
+                        frame = null;
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[Dispose Error] 例外: {ex.Message}");
+                        frame = null;
+                    }
                 }
 
                 isDisposed = true;
             }
         }
+
     }
 }

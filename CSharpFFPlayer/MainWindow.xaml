@@ -15,5 +15,17 @@
             Name="VideoImage"
             HorizontalAlignment="Stretch"
             VerticalAlignment="Stretch" />
+        <Slider
+            x:Name="SeekSlider"
+            Margin="20,0,20,5"
+            VerticalAlignment="Bottom"
+            IsSnapToTickEnabled="True"
+            Maximum="{Binding TotalFrames}"
+            Minimum="0"
+            PreviewMouseDown="SeekSlider_PreviewMouseDown"
+            PreviewMouseUp="SeekSlider_PreviewMouseUp"
+            TickFrequency="1"
+            Value="{Binding CurrentFrame, Mode=TwoWay}" />
+
     </Grid>
 </Window>
