@@ -4,6 +4,7 @@ using NAudio.Wave.SampleProviders;
 using System;
 using System.IO;
 using System.Threading.Tasks;
+using System.Diagnostics.Eventing.Reader;
 
 namespace CSharpFFPlayer
 {
@@ -12,6 +13,7 @@ namespace CSharpFFPlayer
         private WasapiOut output;
         private BufferedWaveProvider bufferedWaveProvider;
         private IWaveProvider finalProvider;
+        private long offsetBytes = 0;
 
         /// <summary>
         /// 現在のバッファに保持されている音声の持続時間（ミリ秒単位）
@@ -84,22 +86,23 @@ namespace CSharpFFPlayer
         }
 
         /// <summary>
-        /// 現在の補正込み再生バイト数を返します（累積位置）
+        /// 現在の補正付き再生位置（バイト単位）
         /// </summary>
-        public long GetPosition()
+        public long GetPosition(bool includeOffset = true)
         {
-            long current = output?.GetPosition() ?? 0;
-            return current;
+            long pos = output?.GetPosition() ?? 0;
+            return includeOffset ? pos + offsetBytes : pos;
         }
 
         /// <summary>
-        /// 音声バッファをクリアし、再生位置オフセットもリセットします。
+        /// 音声バッファをクリアし、オフセットも初期化
         /// </summary>
         public void ResetBuffer()
         {
+            offsetBytes = 0;
+
             if (bufferedWaveProvider != null)
             {
-                // 現在のバッファに格納されているサンプルを読み飛ばして削除
                 while (bufferedWaveProvider.BufferedBytes > 0)
                 {
                     byte[] dummy = new byte[bufferedWaveProvider.BufferedBytes];
@@ -107,6 +110,7 @@ namespace CSharpFFPlayer
                 }
             }
         }
+
 
 
         /// <summary>
@@ -131,22 +135,41 @@ namespace CSharpFFPlayer
         }
 
         /// <summary>
-        /// 音声の一時停止処理。再生中のみ適用される。
+        /// 再生位置を「絶対バイト数」で補正します（シーク時）
         /// </summary>
-        public void Pause()
+        public void SetAbsolutePosition(long absolutePositionBytes)
         {
-            if (output?.PlaybackState == NAudio.Wave.PlaybackState.Playing)
+            long currentRaw = output?.GetPosition() ?? 0;
+            offsetBytes = absolutePositionBytes - currentRaw;
+
+            Console.WriteLine($"[Audio] SetAbsolutePosition → Absolute={absolutePositionBytes}, Raw={currentRaw}, Offset={offsetBytes}");
+        }
+
+        /// <summary>
+        /// 再生一時停止。recordOffset = true の場合は一時停止時点までの位置を記録
+        /// </summary>
+        public void Pause(bool recordOffset = false)
+        {
+            try
             {
-                try
+                if (recordOffset && output?.PlaybackState == NAudio.Wave.PlaybackState.Playing)
+                {
+                    long current = output.GetPosition();
+                    offsetBytes += current;
+                    Console.WriteLine($"[Audio] Pause → offsetBytes += {current} → {offsetBytes}");
+                }
+
+                if (output?.PlaybackState == NAudio.Wave.PlaybackState.Playing)
                 {
                     output.Pause();
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[Audio] Error on Pause: {ex.Message}");
-                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Audio] Error on Pause: {ex.Message}");
             }
         }
+
 
         /// <summary>
         /// 一時停止状態からの再開

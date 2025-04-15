@@ -73,7 +73,8 @@ namespace CSharpFFPlayer
                     SampleRate = frame->sample_rate,
                     Channel = frame->ch_layout.nb_channels,
                     SizeOf = sampleSize,
-                    Data = buffer
+                    Data = buffer,
+                    TotalSize = convertedSamples * frame->ch_layout.nb_channels * sampleSize
                 };
             }
             finally
@@ -97,6 +98,8 @@ namespace CSharpFFPlayer
         public int SizeOf { get; set; }
 
         public nint Data { get; set; }
+
+        public int TotalSize{ get; set; }
 
         /// <summary>
         /// バッファを ReadOnlySpan<byte> として取得する。
