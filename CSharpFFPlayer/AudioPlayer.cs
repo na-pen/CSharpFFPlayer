@@ -83,42 +83,13 @@ namespace CSharpFFPlayer
             throw new NotSupportedException($"Unsupported WaveFormat: {format.Encoding} {format.BitsPerSample}bit");
         }
 
-        private long playbackOffsetBytes = 0;
-
-        /// <summary>
-        /// シーク直後などに呼び出して、現在の再生バイト数を基準として記録します。
-        /// </summary>
-        public void ResetPlaybackTime()
-        {
-            playbackOffsetBytes = output?.GetPosition() ?? 0;
-        }
-
-        /// <summary>
-        /// シークで任意の再生バイト位置にリセットする場合（手動オフセット指定）
-        /// </summary>
-        public void ResetPlaybackTime(long targetByteOffset)
-        {
-            playbackOffsetBytes = targetByteOffset;
-        }
-
         /// <summary>
         /// 現在の補正込み再生バイト数を返します（累積位置）
         /// </summary>
         public long GetPosition()
         {
             long current = output?.GetPosition() ?? 0;
-            return current - playbackOffsetBytes;
-        }
-
-        /// <summary>
-        /// 現在の累積再生時間（TimeSpan）を返します。
-        /// </summary>
-        public TimeSpan GetPositionTime()
-        {
-            int bytesPerSec = AverageBytesPerSecond;
-            if (bytesPerSec <= 0) return TimeSpan.Zero;
-
-            return TimeSpan.FromSeconds((double)GetPosition() / bytesPerSec);
+            return current;
         }
 
         /// <summary>
@@ -192,34 +163,6 @@ namespace CSharpFFPlayer
                 {
                     Console.WriteLine($"[Audio] Error on Resume: {ex.Message}");
                 }
-            }
-        }
-
-        /// <summary>
-        /// PCMストリームからデータを一定量ずつ読み取り、バッファに追加する（非同期）
-        /// </summary>
-        public async Task FeedStreamAsync(Stream bufferedPCMStream)
-        {
-            if (bufferedPCMStream == null || bufferedWaveProvider == null)
-            {
-                Console.WriteLine("[Audio] Stream is null or not initialized.");
-                return;
-            }
-
-            byte[] buffer = new byte[bufferedWaveProvider.WaveFormat.AverageBytesPerSecond];
-
-            try
-            {
-                int bytesRead;
-                while ((bytesRead = await bufferedPCMStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                {
-                    bufferedWaveProvider.AddSamples(buffer, 0, bytesRead);
-                    await Task.Delay(50); // 過剰な供給を防ぐための短い待機
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[Audio] Error during stream feed: {ex.Message}");
             }
         }
 

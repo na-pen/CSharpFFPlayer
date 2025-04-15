@@ -190,12 +190,13 @@ namespace CSharpFFPlayer
         /// </summary>
         /// <param name="path">開くファイルのパス。</param>
         /// <exception cref="InvalidOperationException" />
-        public void OpenFile(string path)
+        public double OpenFile(string path)
         {
             unsafe
             {
                 AVFormatContext* _formatContext = null;
                 AVDictionary* formatOptions = null;
+                double durationMs = 0.0;
 
                 try
                 {
@@ -218,7 +219,7 @@ namespace CSharpFFPlayer
                     if (ret < 0)
                         throw new InvalidOperationException("ストリーム情報の取得に失敗しました。");
                     // コンソールに詳細出力
-                    PrintMediaInfo(formatContext, path);
+                    durationMs = PrintMediaInfo(formatContext, path);
 
                     // 最初の映像・音声ストリームを取得
                     videoStream = GetFirstVideoStream();
@@ -229,6 +230,7 @@ namespace CSharpFFPlayer
                     // formatOptions のメモリを解放
                     ffmpeg.av_dict_free(&formatOptions);
                 }
+                return durationMs;
             }
         }
 
@@ -237,12 +239,12 @@ namespace CSharpFFPlayer
         /// </summary>
         /// <param name="formatContext">取得済みの AVFormatContext*</param>
         /// <param name="path">入力ファイルのパス</param>
-        public static unsafe void PrintMediaInfo(AVFormatContext* formatContext, string path)
+        public static unsafe double PrintMediaInfo(AVFormatContext* formatContext, string path)
         {
             if (formatContext == null)
             {
                 Console.WriteLine("AVFormatContext が null です。");
-                return;
+                return -1;
             }
 
             Console.WriteLine($"--- メディア情報: {path} ---");
@@ -287,6 +289,7 @@ namespace CSharpFFPlayer
             }
 
             Console.WriteLine($"--- メディア情報の出力完了 ---");
+            return durationMs;
         }
 
         /// <summary>
@@ -417,6 +420,34 @@ namespace CSharpFFPlayer
                     ffmpeg.av_packet_free(&tmp);       // パケット構造体自体の解放
                 }
             }
+        }
+        public void SetVideoCodecContextPointer(AVCodecContext* ptr)
+        {
+            videoCodecContext = ptr;
+        }
+        public unsafe void ReinitializeVideoCodecContext()
+        {
+            if (videoCodecContext != null)
+            {
+                AVCodecContext* tmp = videoCodecContext;
+                ffmpeg.avcodec_free_context(&tmp);
+                videoCodecContext = null;
+            }
+
+            // AVCodecContext を新しく作成し初期化
+            videoCodecContext = ffmpeg.avcodec_alloc_context3(null);
+            ffmpeg.avcodec_parameters_to_context(videoCodecContext, videoStream->codecpar);
+
+            AVCodec* codec = ffmpeg.avcodec_find_decoder(videoCodecContext->codec_id);
+            if (codec == null || ffmpeg.avcodec_open2(videoCodecContext, codec, null) < 0)
+            {
+                throw new InvalidOperationException("Video codec の再初期化に失敗しました。");
+            }
+        }
+
+        public unsafe void SetVideoCodecContext(AVCodecContext* ctx)
+        {
+            videoCodecContext = ctx;
         }
 
         private object sendPackedSyncObject = new();

@@ -108,6 +108,9 @@ namespace CSharpFFPlayer
             _writeableBitmap = _videoPlayController.CreateBitmap(dpiX, dpiY);
             VideoImage.Source = _writeableBitmap;
 
+
+            _ = UpdateSeekSliderLoopAsync();
+
             // 動画再生を開始
             await _videoPlayController.Play();
         }
@@ -137,12 +140,66 @@ namespace CSharpFFPlayer
             }
         }
 
+
         /// <summary>
         /// 停止ボタンのクリックイベントで動画を停止。
         /// </summary>
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
             _videoPlayController.Stop();
+        }
+
+        private bool isDraggingSlider = false;
+        private bool isUpdatingSlider = false;
+
+        private void SeekSlider_PreviewMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            isDraggingSlider = true;
+            //_videoPlayController.Pause(); // 一時停止
+        }
+
+        private async void SeekSlider_PreviewMouseUp(object sender, MouseButtonEventArgs e)
+        {
+            isDraggingSlider = false;
+
+            long targetFrame = (long)SeekSlider.Value;
+            Console.WriteLine($"{targetFrame}");
+            bool success = await _videoPlayController.SeekToExactFrameAsync(targetFrame);
+
+            if (success)
+            {
+                Console.WriteLine($"[シークバー] フレーム {targetFrame} にシーク成功");
+            }
+            else
+            {
+                Console.WriteLine($"[シークバー] シーク失敗");
+            }
+        }
+
+        private async Task UpdateSeekSliderLoopAsync()
+        {
+            isUpdatingSlider = true;
+            SeekSlider.Minimum = 0;
+
+            while (isUpdatingSlider)
+            {
+                long totalFrames = _videoPlayController.GetTotalFrameCount();
+                SeekSlider.Maximum = totalFrames;
+
+                if (!isDraggingSlider && _videoPlayController.IsPlaying)
+                {
+                    // 現在のフレーム位置を取得してスライダーに反映
+                    long currentFrame = _videoPlayController.FrameIndex;
+
+                    // UIスレッドで操作（念のため Dispatcher 使用）
+                    await Dispatcher.InvokeAsync(() =>
+                    {
+                        SeekSlider.Value = currentFrame;
+                    });
+                }
+
+                await Task.Delay(100); // 100msごとに更新
+            }
         }
     }
 }
