@@ -11,6 +11,7 @@ using System.Runtime.Intrinsics.X86;
 using System.Drawing.Imaging;
 using System.Windows.Controls;
 using System.Threading.Channels;
+using System.Diagnostics.Eventing.Reader;
 
 namespace CSharpFFPlayer
 {
@@ -54,6 +55,7 @@ namespace CSharpFFPlayer
 
         private uint decodedFrames = 0;
         private AVRational rawFps;
+        private AVRational videoFps;
         private double fps = 0;
         private double baseFrameDurationMs = 0;
 
@@ -288,7 +290,7 @@ namespace CSharpFFPlayer
 
                     if (readResult == FrameReadResult.FrameAvailable)
                     {
-                        var ptsFrameIndex = GetFrameIndex(frame);
+                        var ptsFrameIndex = GetRawFrameIndex(frame);
                         if (ptsFrameIndex == null)
                         {
                             frame.Dispose();
@@ -331,7 +333,7 @@ namespace CSharpFFPlayer
                             //long audioPts2 = (long)(((double)targetFrameIndex * (double)audioTimeBase.den) / (((double)audioTimeBase.num) * (double)fps));
                             long audioPts = ffmpeg.av_rescale_q(
     frameIndex,
-    new AVRational { num = 1, den = (int)Math.Round(fps) },
+    new AVRational { num = videoFps.den, den = videoFps.num },
     audioTimeBase
 );
 
@@ -462,6 +464,7 @@ namespace CSharpFFPlayer
 
                 //(frameIndex, _) = GetCurrentFrameInfo(fps, TimeSpan.FromSeconds(audioPlayer.GetPosition() / (double)audioPlayer.AverageBytesPerSecond));
                 Console.WriteLine($"[シーク完了] フレーム {frameIndex}/{GetCurrentFrameInfo(fps, TimeSpan.FromSeconds(audioPlayer.GetPosition() / (double)audioPlayer.AverageBytesPerSecond))} に正常移動（frames.Count={frames.Count}）");
+                Console.WriteLine($"Audio : {TimeSpan.FromSeconds(audioPlayer.GetPosition() / (double)audioPlayer.AverageBytesPerSecond)}, Movie : {TimeSpan.FromSeconds(frameIndex / fps)}");
                 playbackState = PlaybackState.Paused;
             }
             finally
@@ -491,7 +494,15 @@ namespace CSharpFFPlayer
             await WaitForBuffer();
 
             rawFps = decoder.VideoStream.avg_frame_rate;
-            fps = (rawFps.num == 1000 && rawFps.den == 33) ? 29.97 : rawFps.num / (double)rawFps.den;
+            if (rawFps.num == 1000 && rawFps.den == 33)
+            {
+                videoFps.num = 30000;
+                videoFps.den = 1001;
+
+                fps = 29.97;
+            }
+            else
+                videoFps = rawFps;
             baseFrameDurationMs = 1000.0 / fps;
             TimeSpan frameDuration = TimeSpan.FromMilliseconds(baseFrameDurationMs);
 
@@ -675,6 +686,26 @@ namespace CSharpFFPlayer
         /// フレームのPTSからフレームインデックスを計算
         /// </summary>
         public unsafe long? GetFrameIndex(ManagedFrame frame)
+        {
+            if (frame != null)
+            {
+                if (frame.Frame->pts == ffmpeg.AV_NOPTS_VALUE)
+                    return null;
+
+                AVRational timeBase = decoder.VideoStream.time_base;
+
+                long frameIndex = ffmpeg.av_rescale_q(
+                    frame.Frame->pts,
+                    timeBase,
+                    new AVRational { num = videoFps.den, den = videoFps.num } // ← 秒単位に変換 → フレームに換算
+                );
+
+                return frameIndex;
+            }
+            return 0;
+        }
+
+        public unsafe long? GetRawFrameIndex(ManagedFrame frame)
         {
             if (frame != null)
             {
