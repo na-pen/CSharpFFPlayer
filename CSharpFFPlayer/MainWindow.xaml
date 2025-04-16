@@ -1,31 +1,41 @@
-﻿<Window
+﻿<mahApps:MetroWindow
     x:Class="CSharpFFPlayer.MainWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:local="clr-namespace:CSharpFFPlayer"
+    xmlns:mahApps="clr-namespace:MahApps.Metro.Controls;assembly=MahApps.Metro"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     Title="MainWindow"
     Width="800"
     Height="450"
     KeyDown="Window_KeyDown"
     mc:Ignorable="d">
-    <Grid>
-        <Image
-            Name="VideoImage"
-            HorizontalAlignment="Stretch"
-            VerticalAlignment="Stretch" />
-        <Slider
-            x:Name="SeekSlider"
-            Margin="20,0,20,5"
-            VerticalAlignment="Bottom"
-            IsSnapToTickEnabled="True"
-            Maximum="{Binding TotalFrames}"
-            Minimum="0"
-            PreviewMouseDown="SeekSlider_PreviewMouseDown"
-            PreviewMouseUp="SeekSlider_PreviewMouseUp"
-            TickFrequency="1"
-            Value="{Binding CurrentFrame, Mode=TwoWay}" />
 
-    </Grid>
-</Window>
+    <mahApps:MetroWindow.RightWindowCommands>
+        <mahApps:WindowCommands>
+            <Button Content="settings" />
+        </mahApps:WindowCommands>
+    </mahApps:MetroWindow.RightWindowCommands>
+
+    <DockPanel>
+        <Grid Background="DimGray">
+            <Image
+                Name="VideoImage"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch" />
+            <Slider
+                x:Name="SeekSlider"
+                Margin="20,0,20,5"
+                VerticalAlignment="Bottom"
+                IsSnapToTickEnabled="True"
+                Maximum="{Binding TotalFrames}"
+                Minimum="0"
+                PreviewMouseDown="SeekSlider_PreviewMouseDown"
+                PreviewMouseUp="SeekSlider_PreviewMouseUp"
+                TickFrequency="1"
+                Value="{Binding CurrentFrame, Mode=TwoWay}" />
+
+        </Grid>
+    </DockPanel>
+</mahApps:MetroWindow>

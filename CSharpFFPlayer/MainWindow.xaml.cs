@@ -10,7 +10,7 @@ using System.Windows.Threading;
 
 namespace CSharpFFPlayer
 {
-    public partial class MainWindow : Window
+    public partial class MainWindow : MahApps.Metro.Controls.MetroWindow
     {
         private VideoPlayController _videoPlayController;
         private WriteableBitmap _writeableBitmap;
