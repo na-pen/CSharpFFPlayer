@@ -12,6 +12,7 @@ using System.Drawing.Imaging;
 using System.Windows.Controls;
 using System.Threading.Channels;
 using System.Diagnostics.Eventing.Reader;
+using System.Xml.Linq;
 
 namespace CSharpFFPlayer
 {
@@ -37,7 +38,7 @@ namespace CSharpFFPlayer
         private static readonly System.Windows.Media.PixelFormat wpfPixelFormat = PixelFormats.Bgr24;
 
         private PlaybackState playbackState = PlaybackState.Stopped;
-        public bool IsPlaying => playbackState == PlaybackState.Playing;
+        public bool IsPlaying => playbackState == PlaybackState.Playing || playbackState == PlaybackState.EndedStream;
         public bool IsPaused => playbackState == PlaybackState.Paused;
         public bool IsSeeking => playbackState == PlaybackState.Seeking;
         public bool IsBuffering => playbackState == PlaybackState.Buffering;
@@ -166,6 +167,7 @@ namespace CSharpFFPlayer
         /// </summary>
         public void Stop()
         {
+            Pause();
             playbackState = PlaybackState.Stopped;
 
             while (frames.TryDequeue(out var remainingFrame))
@@ -210,7 +212,7 @@ namespace CSharpFFPlayer
 
                 long target = ffmpeg.av_rescale_q(targetFrameIndex, rawFps, videoTimeBase);
                 long targetPts = ffmpeg.av_rescale_q(
-    targetFrameIndex,
+    targetFrameIndex -1,
     new AVRational { num = rawFps.den, den = rawFps.num }, // → 秒単位の time_base
     videoTimeBase
 );
@@ -298,7 +300,7 @@ namespace CSharpFFPlayer
                             continue;
                         }
 
-                        if (ptsFrameIndex.Value != targetFrameIndex)
+                        if (ptsFrameIndex.Value != targetFrameIndex -1)
                         {
                             Console.WriteLine($"[読み飛ばし] {ptsFrameIndex.Value}");
                             frame.Dispose();
@@ -319,6 +321,22 @@ namespace CSharpFFPlayer
 
                 frames.Enqueue(matchedFrame);
                 frameIndex = (int)GetFrameIndex(matchedFrame);
+
+                await transferLimiter.WaitAsync();
+                try
+                {
+                    unsafe { matchedFrame.GetCpuFrame(); }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[転送失敗] {ex.Message}");
+                }
+                finally
+                {
+                    transferLimiter.Release();
+                }
+
+                imageWriter.WriteFrame(matchedFrame, frameConveter);
                 Console.WriteLine($"[シーク完了] 実フレーム: {frameIndex}");
 
                 await decoderLock.WaitAsync();
@@ -818,7 +836,7 @@ namespace CSharpFFPlayer
                 if (result == FrameReadResult.EndOfStream && !playbackState.Equals(PlaybackState.EndedStream))
                 {
                     Console.WriteLine("[EOF] 映像ストリームの終端を検出しました");
-                    playbackState = PlaybackState.EndedStream;
+                    playbackState = (playbackState != PlaybackState.SeekBuffering) ? PlaybackState.EndedStream : playbackState;
                 }
 
                 // ==== 転送処理 ====

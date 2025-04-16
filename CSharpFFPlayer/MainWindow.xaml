@@ -11,12 +11,46 @@
     Height="450"
     KeyDown="Window_KeyDown"
     mc:Ignorable="d">
-
-    <mahApps:MetroWindow.RightWindowCommands>
+    
+    <mahApps:MetroWindow.LeftWindowCommands>
         <mahApps:WindowCommands>
+            <mahApps:DropDownButton
+                Content="ファイル" Foreground="White">
+                <mahApps:DropDownButton.Items>
+
+                    <MenuItem Click="Open" Height="23">
+                        <MenuItem.Header>
+                            <TextBlock Text="開く" TextAlignment="Left" VerticalAlignment="Center" FontSize="13" />
+                        </MenuItem.Header>
+                    </MenuItem>
+
+                    <MenuItem Click="Exit" Height="23">
+                        <MenuItem.Header>
+                            <TextBlock Text="終了" TextAlignment="Left" VerticalAlignment="Center" FontSize="13" />
+                        </MenuItem.Header>
+                    </MenuItem>
+                </mahApps:DropDownButton.Items>
+            </mahApps:DropDownButton>
+
+            <mahApps:DropDownButton
+    Content="再生" Foreground="White">
+                <mahApps:DropDownButton.Items>
+
+                    <MenuItem Click="KeyDown_Space" Height="23">
+                        <MenuItem.Header>
+                            <TextBlock Text="一時停止/再開" TextAlignment="Left" VerticalAlignment="Center" FontSize="13" />
+                        </MenuItem.Header>
+                    </MenuItem>
+                    <MenuItem Click="StopButton_Click" Height="23">
+                        <MenuItem.Header>
+                            <TextBlock Text="停止" TextAlignment="Left" VerticalAlignment="Center" FontSize="13"/>
+                        </MenuItem.Header>
+                    </MenuItem>
+                </mahApps:DropDownButton.Items>
+            </mahApps:DropDownButton>
             <Button Content="settings" />
         </mahApps:WindowCommands>
-    </mahApps:MetroWindow.RightWindowCommands>
+    </mahApps:MetroWindow.LeftWindowCommands>
 
     <DockPanel>
         <Grid Background="DimGray">

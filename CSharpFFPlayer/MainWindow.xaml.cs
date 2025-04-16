@@ -12,35 +12,45 @@ namespace CSharpFFPlayer
 {
     public partial class MainWindow : MahApps.Metro.Controls.MetroWindow
     {
-        private VideoPlayController _videoPlayController;
+        private VideoPlayController? _videoPlayController = null;
         private WriteableBitmap _writeableBitmap;
 
         public MainWindow()
         {
             InitializeComponent();
-            _videoPlayController = new VideoPlayController();
+
+        }
+
+        private void Open(object sender, RoutedEventArgs e)
+        {
 
             // ファイル選択ダイアログを表示
             if (!TryOpenVideoFile(out string filePath))
             {
-                Close(); // ファイル選択がキャンセルされたら終了
                 return;
             }
 
             // 動画ファイルを開く
             try
             {
+                _videoPlayController?.Stop();
+                _videoPlayController = new VideoPlayController();
                 _videoPlayController.OpenFile(filePath);
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"ファイルのオープンに失敗しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
-                Close();
                 return;
             }
-
-            // ウィンドウ表示後の初期化を登録
-            Loaded += LoadedProc;
+            try
+            {
+                InitializeAndStartVideo();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"動画の初期化中にエラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
         }
 
         /// <summary>
@@ -64,34 +74,6 @@ namespace CSharpFFPlayer
             }
         }
 
-        /// <summary>
-        /// ウィンドウがアクティブになったタイミングで再生開始処理を実行する。
-        /// </summary>
-        private async void LoadedProc(object sender, RoutedEventArgs e)
-        {
-            // ウィンドウがアクティブになるまで待機（最大5秒）
-            await Task.Run(() =>
-            {
-                int waitTimeMs = 0;
-                while (!Application.Current.Dispatcher.Invoke(() => IsActive))
-                {
-                    Thread.Sleep(100);
-                    waitTimeMs += 100;
-                    if (waitTimeMs > 5000)
-                        break;
-                }
-            });
-
-            try
-            {
-                InitializeAndStartVideo();
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"動画の初期化中にエラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
-                Close();
-            }
-        }
 
         /// <summary>
         /// 動画描画に必要なリソースを初期化し、再生を開始する。
@@ -107,7 +89,6 @@ namespace CSharpFFPlayer
             // WriteableBitmapを生成し、描画対象に設定
             _writeableBitmap = _videoPlayController.CreateBitmap(dpiX, dpiY);
             VideoImage.Source = _writeableBitmap;
-
 
             _ = UpdateSeekSliderLoopAsync();
 
@@ -140,6 +121,24 @@ namespace CSharpFFPlayer
             }
         }
 
+        private async void KeyDown_Space(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                if (_videoPlayController.IsPaused || !_videoPlayController.IsPlaying)
+                {
+                    await _videoPlayController.Play(); // 再生または再開
+                }
+                else
+                {
+                    _videoPlayController.Pause(); // 一時停止
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"再生切替中にエラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
 
         /// <summary>
         /// 停止ボタンのクリックイベントで動画を停止。
@@ -200,6 +199,11 @@ namespace CSharpFFPlayer
 
                 await Task.Delay(100); // 100msごとに更新
             }
+        }
+
+        private void Exit(object sender, RoutedEventArgs e)
+        {
+            Application.Current.Shutdown();
         }
     }
 }
