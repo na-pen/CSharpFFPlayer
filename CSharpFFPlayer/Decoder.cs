@@ -190,13 +190,13 @@ namespace CSharpFFPlayer
         /// </summary>
         /// <param name="path">開くファイルのパス。</param>
         /// <exception cref="InvalidOperationException" />
-        public double OpenFile(string path)
+        public VideoInfo OpenFile(string path)
         {
             unsafe
             {
                 AVFormatContext* _formatContext = null;
                 AVDictionary* formatOptions = null;
-                double durationMs = 0.0;
+                VideoInfo videoInfo = new();
 
                 try
                 {
@@ -219,7 +219,8 @@ namespace CSharpFFPlayer
                     if (ret < 0)
                         throw new InvalidOperationException("ストリーム情報の取得に失敗しました。");
                     // コンソールに詳細出力
-                    durationMs = PrintMediaInfo(formatContext, path);
+                    videoInfo = GetVideoInfo(formatContext, path);
+                    PrintVideoInfo(videoInfo);
 
                     // 最初の映像・音声ストリームを取得
                     videoStream = GetFirstVideoStream();
@@ -230,32 +231,72 @@ namespace CSharpFFPlayer
                     // formatOptions のメモリを解放
                     ffmpeg.av_dict_free(&formatOptions);
                 }
-                return durationMs;
+                return videoInfo;
             }
         }
+
+        public static void PrintVideoInfo(VideoInfo info)
+        {
+            Console.WriteLine($"--- メディア情報: {info.FilePath} ---");
+
+            Console.WriteLine($"再生時間: {info.Duration.Milliseconds:F0} ミリ秒");
+            Console.WriteLine($"ストリーム数: {info.StreamCount}");
+            Console.WriteLine($"ビットレート: {info.BitRate.BitsPerSecond} bps");
+
+            foreach (var v in info.VideoStreams)
+            {
+                Console.WriteLine($"\n[映像ストリーム #{v.Index}]");
+                Console.WriteLine($"  コーデック: {v.CodecName}");
+                Console.WriteLine($"  解像度: {v.Resolution.Width} x {v.Resolution.Height}");
+                Console.WriteLine($"  推定FPS: {v.Fps:F3}");
+                Console.WriteLine($"  タイムベース: {v.TimeBase.Num}/{v.TimeBase.Den}");
+            }
+
+            foreach (var a in info.AudioStreams)
+            {
+                Console.WriteLine($"\n[音声ストリーム #{a.Index}]");
+                Console.WriteLine($"  コーデック: {a.CodecName}");
+                Console.WriteLine($"  サンプルレート: {a.SampleRate} Hz");
+                Console.WriteLine($"  チャンネル数: {a.Channels}");
+                Console.WriteLine($"  タイムベース: {a.TimeBase.Num}/{a.TimeBase.Den}");
+            }
+
+            foreach (var o in info.OtherStreams)
+            {
+                Console.WriteLine($"\n[その他ストリーム #{o.Index}] 種類: {o.StreamType}");
+            }
+
+            Console.WriteLine($"--- メディア情報の出力完了 ---");
+        }
+
 
         /// <summary>
         /// AVFormatContext から動画/音声ストリームの情報を標準出力に出力します。
         /// </summary>
         /// <param name="formatContext">取得済みの AVFormatContext*</param>
         /// <param name="path">入力ファイルのパス</param>
-        public static unsafe double PrintMediaInfo(AVFormatContext* formatContext, string path)
+        public unsafe VideoInfo GetVideoInfo(AVFormatContext* formatContext, string path)
         {
             if (formatContext == null)
             {
                 Console.WriteLine("AVFormatContext が null です。");
-                return -1;
+                return null;
             }
 
-            Console.WriteLine($"--- メディア情報: {path} ---");
+            var videoInfo = new VideoInfo
+            {
+                FilePath = path,
+                Duration = new TimeInfo
+                {
+                    Milliseconds = formatContext->duration / (double)ffmpeg.AV_TIME_BASE * 1000
+                },
+                StreamCount = (int)formatContext->nb_streams,
+                BitRate = new BitRateInfo
+                {
+                    BitsPerSecond = formatContext->bit_rate
+                }
+            };
 
-            // 全体情報
-            double durationMs = formatContext->duration / (double)ffmpeg.AV_TIME_BASE * 1000;
-            Console.WriteLine($"再生時間: {durationMs:F0} ミリ秒");
-            Console.WriteLine($"ストリーム数: {formatContext->nb_streams}");
-            Console.WriteLine($"ビットレート: {formatContext->bit_rate} bps");
-
-            // 各ストリームの情報
             for (int i = 0; i < formatContext->nb_streams; i++)
             {
                 AVStream* stream = formatContext->streams[i];
@@ -268,29 +309,51 @@ namespace CSharpFFPlayer
                         ? stream->r_frame_rate.num / (double)stream->r_frame_rate.den
                         : 0.0;
 
-                    Console.WriteLine($"\n[映像ストリーム #{i}]");
-                    Console.WriteLine($"  コーデック: {ffmpeg.avcodec_get_name(codecpar->codec_id)}");
-                    Console.WriteLine($"  解像度: {codecpar->width} x {codecpar->height}");
-                    Console.WriteLine($"  推定FPS: {fps:F3}");
-                    Console.WriteLine($"  タイムベース: {timeBase.num}/{timeBase.den}");
+                    videoInfo.VideoStreams.Add(new VideoStreamInfo
+                    {
+                        Index = i,
+                        CodecName = ffmpeg.avcodec_get_name(codecpar->codec_id),
+                        Resolution = new ResolutionInfo
+                        {
+                            Width = codecpar->width,
+                            Height = codecpar->height
+                        },
+                        Fps = fps,
+                        TimeBase = new Rational
+                        {
+                            Num = timeBase.num,
+                            Den = timeBase.den
+                        }
+                    });
                 }
                 else if (codecpar->codec_type == AVMediaType.AVMEDIA_TYPE_AUDIO)
                 {
-                    Console.WriteLine($"\n[音声ストリーム #{i}]");
-                    Console.WriteLine($"  コーデック: {ffmpeg.avcodec_get_name(codecpar->codec_id)}");
-                    Console.WriteLine($"  サンプルレート: {codecpar->sample_rate} Hz");
-                    Console.WriteLine($"  チャンネル数: {codecpar->ch_layout.nb_channels}");
-                    Console.WriteLine($"  タイムベース: {timeBase.num}/{timeBase.den}");
+                    videoInfo.AudioStreams.Add(new AudioStreamInfo
+                    {
+                        Index = i,
+                        CodecName = ffmpeg.avcodec_get_name(codecpar->codec_id),
+                        SampleRate = codecpar->sample_rate,
+                        Channels = codecpar->ch_layout.nb_channels,
+                        TimeBase = new Rational
+                        {
+                            Num = timeBase.num,
+                            Den = timeBase.den
+                        }
+                    });
                 }
                 else
                 {
-                    Console.WriteLine($"\n[その他ストリーム #{i}] 種類: {codecpar->codec_type}");
+                    videoInfo.OtherStreams.Add(new OtherStreamInfo
+                    {
+                        Index = i,
+                        StreamType = codecpar->codec_type.ToString()
+                    });
                 }
             }
 
-            Console.WriteLine($"--- メディア情報の出力完了 ---");
-            return durationMs;
+            return videoInfo;
         }
+
 
         /// <summary>
         /// 映像・音声デコーダの初期化を行います。必要に応じてハードウェアデコードを使用します。
