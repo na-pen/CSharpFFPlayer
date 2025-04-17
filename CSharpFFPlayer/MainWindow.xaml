@@ -5,45 +5,60 @@
     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
     xmlns:local="clr-namespace:CSharpFFPlayer"
     xmlns:mahApps="clr-namespace:MahApps.Metro.Controls;assembly=MahApps.Metro"
+    xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     Title="MainWindow"
     Width="800"
     Height="450"
     KeyDown="Window_KeyDown"
     mc:Ignorable="d">
-    
+
     <mahApps:MetroWindow.LeftWindowCommands>
         <mahApps:WindowCommands>
-            <mahApps:DropDownButton
-                Content="ファイル" Foreground="White">
+            <mahApps:DropDownButton Content="ファイル" Foreground="White">
                 <mahApps:DropDownButton.Items>
 
-                    <MenuItem Click="Open" Height="23">
+                    <MenuItem Height="23" Click="Open">
                         <MenuItem.Header>
-                            <TextBlock Text="開く" TextAlignment="Left" VerticalAlignment="Center" FontSize="13" />
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                FontSize="13"
+                                Text="開く"
+                                TextAlignment="Left" />
                         </MenuItem.Header>
                     </MenuItem>
 
-                    <MenuItem Click="Exit" Height="23">
+                    <MenuItem Height="23" Click="Exit">
                         <MenuItem.Header>
-                            <TextBlock Text="終了" TextAlignment="Left" VerticalAlignment="Center" FontSize="13" />
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                FontSize="13"
+                                Text="終了"
+                                TextAlignment="Left" />
                         </MenuItem.Header>
                     </MenuItem>
                 </mahApps:DropDownButton.Items>
             </mahApps:DropDownButton>
 
-            <mahApps:DropDownButton
-    Content="再生" Foreground="White">
+            <mahApps:DropDownButton Content="再生" Foreground="White">
                 <mahApps:DropDownButton.Items>
 
-                    <MenuItem Click="KeyDown_Space" Height="23">
+                    <MenuItem Height="23" Click="KeyDown_Space">
                         <MenuItem.Header>
-                            <TextBlock Text="一時停止/再開" TextAlignment="Left" VerticalAlignment="Center" FontSize="13" />
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                FontSize="13"
+                                Text="一時停止/再開"
+                                TextAlignment="Left" />
                         </MenuItem.Header>
                     </MenuItem>
-                    <MenuItem Click="StopButton_Click" Height="23">
+                    <MenuItem Height="23" Click="StopButton_Click">
                         <MenuItem.Header>
-                            <TextBlock Text="停止" TextAlignment="Left" VerticalAlignment="Center" FontSize="13"/>
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                FontSize="13"
+                                Text="停止"
+                                TextAlignment="Left" />
                         </MenuItem.Header>
                     </MenuItem>
                 </mahApps:DropDownButton.Items>
@@ -58,18 +73,45 @@
                 Name="VideoImage"
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Stretch" />
-            <Slider
-                x:Name="SeekSlider"
-                Margin="20,0,20,5"
+            <Border
+                Margin="30,0,30,10"
+                Padding="10"
                 VerticalAlignment="Bottom"
-                IsSnapToTickEnabled="True"
-                Maximum="{Binding TotalFrames}"
-                Minimum="0"
-                PreviewMouseDown="SeekSlider_PreviewMouseDown"
-                PreviewMouseUp="SeekSlider_PreviewMouseUp"
-                TickFrequency="1"
-                Value="{Binding CurrentFrame, Mode=TwoWay}" />
-
+                Background="#DDDDDD"
+                BorderBrush="#FF383838"
+                CornerRadius="20,20,20,20">
+                <Grid Margin="20,0,20,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <Button
+                        Grid.Column="0"
+                        Width="30"
+                        Background="White"
+                        BorderBrush="{x:Null}"
+                        Click="KeyDown_Space"
+                        Foreground="#FF757575">
+                        <Button.Style>
+                            <Style TargetType="Button">
+                                <Setter Property="Content" Value="{materialDesign:PackIcon Play}" />
+                            </Style>
+                        </Button.Style>
+                    </Button>
+                    <Slider
+                        x:Name="SeekSlider"
+                        Grid.Column="1"
+                        Margin="20,0,20,0"
+                        VerticalAlignment="Center"
+                        IsSnapToTickEnabled="True"
+                        Maximum="{Binding TotalFrames}"
+                        Minimum="0"
+                        PreviewMouseDown="SeekSlider_PreviewMouseDown"
+                        PreviewMouseUp="SeekSlider_PreviewMouseUp"
+                        TickFrequency="1"
+                        Value="{Binding CurrentFrame, Mode=TwoWay}" />
+                </Grid>
+            </Border>
         </Grid>
     </DockPanel>
 </mahApps:MetroWindow>
