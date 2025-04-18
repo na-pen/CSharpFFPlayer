@@ -89,7 +89,6 @@ namespace CSharpFFPlayer
                 });
 
                 await InitializeAndStartVideo();
-                this.Title = Path.GetFileName(filePath);
             }
             catch (Exception ex)
             {
@@ -141,6 +140,7 @@ namespace CSharpFFPlayer
             TotalDurationDisplay = FormatTime(total);
             ShowLoading(false);
             _ = UpdateSeekSliderLoopAsync();
+            this.Title = Path.GetFileName(_videoPlayController.VideoInfo.FilePath);
 
             await _videoPlayController.Play();
         }
