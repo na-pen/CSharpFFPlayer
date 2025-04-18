@@ -211,6 +211,7 @@ namespace CSharpFFPlayer
         /// </summary>
         public void Dispose()
         {
+            output?.Stop();
             output?.Dispose();
         }
     }

@@ -7,44 +7,102 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using System.ComponentModel;
 
 namespace CSharpFFPlayer
 {
-    public partial class MainWindow : Window
+    public partial class MainWindow : MahApps.Metro.Controls.MetroWindow, INotifyPropertyChanged
     {
-        private VideoPlayController _videoPlayController;
+        private VideoPlayController? _videoPlayController = null;
         private WriteableBitmap _writeableBitmap;
+
+        private bool isDraggingSlider = false;
+        private bool isUpdatingSlider = false;
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        private string _currentTimeDisplay;
+        public string CurrentTimeDisplay
+        {
+            get => _currentTimeDisplay;
+            set
+            {
+                if (_currentTimeDisplay != value)
+                {
+                    _currentTimeDisplay = value;
+                    OnPropertyChanged(nameof(CurrentTimeDisplay));
+                }
+            }
+        }
+
+        private string _totalDurationDisplay = "00:00";
+        public string TotalDurationDisplay
+        {
+            get => _totalDurationDisplay;
+            set
+            {
+                if (_totalDurationDisplay != value)
+                {
+                    _totalDurationDisplay = value;
+                    OnPropertyChanged(nameof(TotalDurationDisplay));
+                }
+            }
+        }
+
+        private void OnPropertyChanged(string name)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
 
         public MainWindow()
         {
             InitializeComponent();
-            _videoPlayController = new VideoPlayController();
+        }
 
-            // ファイル選択ダイアログを表示
-            if (!TryOpenVideoFile(out string filePath))
-            {
-                Close(); // ファイル選択がキャンセルされたら終了
-                return;
-            }
-
-            // 動画ファイルを開く
-            try
-            {
-                _videoPlayController.OpenFile(filePath);
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"ファイルのオープンに失敗しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
-                Close();
-                return;
-            }
-
-            // ウィンドウ表示後の初期化を登録
-            Loaded += LoadedProc;
+        private void ShowLoading(bool isVisible)
+        {
+            LoadingOverlay.Visibility = isVisible ? Visibility.Visible : Visibility.Collapsed;
         }
 
         /// <summary>
-        /// ファイル選択ダイアログを表示して、選択されたファイルのパスを取得する。
+        /// メニューバー「開く」やボタンで呼ばれる動画ファイル選択処理
+        /// </summary>
+        private async void OpenVideo(object sender, RoutedEventArgs e)
+        {
+            if (!TryOpenVideoFile(out string filePath))
+                return;
+
+
+            ShowLoading(true); // ← 開始時に表示
+            try
+            {
+                _videoPlayController?.Stop();
+
+                _videoPlayController = await Task.Run(() =>
+                {
+                    var controller = new VideoPlayController();
+                    controller.OpenFile(filePath);
+                    return controller;
+                });
+
+                await InitializeAndStartVideo();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"ファイルの読み込みに失敗しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            finally
+            {
+                ShowLoading(false); // ← 終了時に非表示
+            }
+        }
+
+
+        /// <summary>
+        /// ファイル選択ダイアログを表示し、選択されたファイルパスを返す
         /// </summary>
         private bool TryOpenVideoFile(out string filePath)
         {
@@ -53,7 +111,7 @@ namespace CSharpFFPlayer
             {
                 Title = "動画を選択してください",
                 InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-                IsFolderPicker = false,
+                IsFolderPicker = false
             })
             {
                 if (dialog.ShowDialog() != CommonFileDialogResult.Ok)
@@ -65,117 +123,132 @@ namespace CSharpFFPlayer
         }
 
         /// <summary>
-        /// ウィンドウがアクティブになったタイミングで再生開始処理を実行する。
+        /// 動画再生のためのビットマップやスライダーなどを初期化し、再生を開始
         /// </summary>
-        private async void LoadedProc(object sender, RoutedEventArgs e)
+        private async Task InitializeAndStartVideo()
         {
-            // ウィンドウがアクティブになるまで待機（最大5秒）
-            await Task.Run(() =>
-            {
-                int waitTimeMs = 0;
-                while (!Application.Current.Dispatcher.Invoke(() => IsActive))
-                {
-                    Thread.Sleep(100);
-                    waitTimeMs += 100;
-                    if (waitTimeMs > 5000)
-                        break;
-                }
-            });
-
-            try
-            {
-                InitializeAndStartVideo();
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"動画の初期化中にエラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Error);
-                Close();
-            }
-        }
-
-        /// <summary>
-        /// 動画描画に必要なリソースを初期化し、再生を開始する。
-        /// </summary>
-        private async void InitializeAndStartVideo()
-        {
-            // 現在のDPIを取得し、WriteableBitmapの作成に使用
             var source = PresentationSource.FromVisual(this);
             var matrix = source?.CompositionTarget?.TransformFromDevice ?? Matrix.Identity;
+
             int dpiX = (int)Math.Round(96 / matrix.M11);
             int dpiY = (int)Math.Round(96 / matrix.M22);
 
-            // WriteableBitmapを生成し、描画対象に設定
             _writeableBitmap = _videoPlayController.CreateBitmap(dpiX, dpiY);
             VideoImage.Source = _writeableBitmap;
 
-
+            TimeSpan total = _videoPlayController.VideoInfo.Duration.ToTimeSpan();
+            TotalDurationDisplay = FormatTime(total);
+            ShowLoading(false);
             _ = UpdateSeekSliderLoopAsync();
+            this.Title = Path.GetFileName(_videoPlayController.VideoInfo.FilePath);
 
-            // 動画再生を開始
             await _videoPlayController.Play();
         }
 
+
         /// <summary>
-        /// Spaceキーで再生/一時停止を切り替える処理。
+        /// Space キーで再生・一時停止を切り替える
         /// </summary>
         private async void Window_KeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key == Key.Space)
+                await TogglePlayPauseAsync();
+        }
+
+        /// <summary>
+        /// 再生・一時停止切り替え（ボタン用）
+        /// </summary>
+        private async void KeyDown_Space(object sender, RoutedEventArgs e)
+        {
+            await TogglePlayPauseAsync();
+        }
+
+        /// <summary>
+        /// 再生・一時停止をトグル
+        /// </summary>
+        private async Task TogglePlayPauseAsync()
+        {
+            try
             {
-                try
-                {
-                    if (_videoPlayController.IsPaused || !_videoPlayController.IsPlaying)
-                    {
-                        await _videoPlayController.Play(); // 再生または再開
-                    }
-                    else
-                    {
-                        _videoPlayController.Pause(); // 一時停止
-                    }
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"再生切替中にエラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Warning);
-                }
+                if (_videoPlayController.IsPaused || !_videoPlayController.IsPlaying)
+                    await _videoPlayController.Play(); // 再開
+                else
+                    _videoPlayController.Pause();      // 一時停止
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"再生切替中にエラーが発生しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Warning);
             }
         }
 
-
         /// <summary>
-        /// 停止ボタンのクリックイベントで動画を停止。
+        /// 停止ボタンで動画を停止
         /// </summary>
         private void StopButton_Click(object sender, RoutedEventArgs e)
         {
-            _videoPlayController.Stop();
+            _videoPlayController?.Stop();
         }
 
-        private bool isDraggingSlider = false;
-        private bool isUpdatingSlider = false;
-
+        /// <summary>
+        /// シークスライダー操作開始時にドラッグ中フラグをON
+        /// </summary>
         private void SeekSlider_PreviewMouseDown(object sender, MouseButtonEventArgs e)
         {
             isDraggingSlider = true;
-            //_videoPlayController.Pause(); // 一時停止
         }
 
+        /// <summary>
+        /// シークスライダー操作終了時、指定フレームへシーク
+        /// </summary>
         private async void SeekSlider_PreviewMouseUp(object sender, MouseButtonEventArgs e)
         {
             isDraggingSlider = false;
 
             long targetFrame = (long)SeekSlider.Value;
-            Console.WriteLine($"{targetFrame}");
+
+            ShowLoading(true); // ← 開始時に表示
             bool success = await _videoPlayController.SeekToExactFrameAsync(targetFrame);
 
             if (success)
             {
                 Console.WriteLine($"[シークバー] フレーム {targetFrame} にシーク成功");
+
+                double fps = _videoPlayController.VideoInfo.VideoStreams.FirstOrDefault()?.Fps ?? 0;
+                if (fps > 0)
+                {
+                    CurrentTimeDisplay = FormatTime((long)(targetFrame / fps));
+                }
             }
             else
             {
                 Console.WriteLine($"[シークバー] シーク失敗");
             }
+            ShowLoading(false);
         }
 
+        /// <summary>
+        /// フレーム数と TimeBase から再生時間を計算し、hh:mm:ss または mm:ss 形式で返す
+        /// </summary>
+        private string FormatTime(long seconds)
+        {
+            var ts = TimeSpan.FromSeconds(seconds);
+
+            return FormatTime(ts);
+        }
+
+        /// <summary>
+        /// フレーム数と TimeBase から再生時間を計算し、hh:mm:ss または mm:ss 形式で返す
+        /// </summary>
+        private string FormatTime(TimeSpan ts)
+        {
+            return ts.Hours > 0
+                ? $"{ts.Hours:D2}:{ts.Minutes:D2}:{ts.Seconds:D2}"
+                : $"{ts.Minutes:D2}:{ts.Seconds:D2}";
+        }
+
+        /// <summary>
+        /// 再生状態やフレーム数に基づいてスライダーとアイコンを定期更新するループ
+        /// </summary>
         private async Task UpdateSeekSliderLoopAsync()
         {
             isUpdatingSlider = true;
@@ -183,23 +256,57 @@ namespace CSharpFFPlayer
 
             while (isUpdatingSlider)
             {
-                long totalFrames = _videoPlayController.GetTotalFrameCount();
-                SeekSlider.Maximum = totalFrames;
-
-                if (!isDraggingSlider && _videoPlayController.IsPlaying)
+                if (_videoPlayController != null)
                 {
-                    // 現在のフレーム位置を取得してスライダーに反映
-                    long currentFrame = _videoPlayController.FrameIndex;
+                    PlayPauseIcon.Kind = _videoPlayController.IsPlaying
+                        ? MaterialDesignThemes.Wpf.PackIconKind.Pause
+                        : MaterialDesignThemes.Wpf.PackIconKind.Play;
 
-                    // UIスレッドで操作（念のため Dispatcher 使用）
+                    long totalFrames = _videoPlayController.GetTotalFrameCount();
+                    SeekSlider.Maximum = totalFrames;
+
+                    long displayFrame = (long)SeekSlider.Value;
+
+                    // 再生中でスライダー操作していないときだけ自動で更新
+                    if (!isDraggingSlider && _videoPlayController.IsPlaying)
+                    {
+                        long currentFrame = _videoPlayController.FrameIndex;
+
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            SeekSlider.Value = currentFrame;
+                        });
+
+                        displayFrame = currentFrame; // 表示も現在位置に合わせる
+                    }
+
+                    // SeekSlider.Value をもとに現在時刻を表示
                     await Dispatcher.InvokeAsync(() =>
                     {
-                        SeekSlider.Value = currentFrame;
+                        double fps = _videoPlayController.VideoInfo.VideoStreams.FirstOrDefault()?.Fps ?? 0;
+                        if (fps > 0)
+                        {
+                            var seconds = displayFrame / fps;
+                            CurrentTimeDisplay = FormatTime((long)seconds);
+                        }
+                        else
+                        {
+                            CurrentTimeDisplay = "00:00";
+                        }
                     });
                 }
 
-                await Task.Delay(100); // 100msごとに更新
+                await Task.Delay(100);
             }
+        }
+
+
+        /// <summary>
+        /// メニュー「終了」でアプリを終了
+        /// </summary>
+        private void Exit(object sender, RoutedEventArgs e)
+        {
+            Application.Current.Shutdown();
         }
     }
 }
