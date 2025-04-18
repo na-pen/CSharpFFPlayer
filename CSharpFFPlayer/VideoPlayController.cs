@@ -12,6 +12,7 @@ using System.Drawing.Imaging;
 using System.Windows.Controls;
 using System.Threading.Channels;
 using System.Diagnostics.Eventing.Reader;
+using System.Xml.Linq;
 
 namespace CSharpFFPlayer
 {
@@ -37,7 +38,7 @@ namespace CSharpFFPlayer
         private static readonly System.Windows.Media.PixelFormat wpfPixelFormat = PixelFormats.Bgr24;
 
         private PlaybackState playbackState = PlaybackState.Stopped;
-        public bool IsPlaying => playbackState == PlaybackState.Playing;
+        public bool IsPlaying => playbackState == PlaybackState.Playing || playbackState == PlaybackState.EndedStream;
         public bool IsPaused => playbackState == PlaybackState.Paused;
         public bool IsSeeking => playbackState == PlaybackState.Seeking;
         public bool IsBuffering => playbackState == PlaybackState.Buffering;
@@ -69,7 +70,8 @@ namespace CSharpFFPlayer
         private static readonly SemaphoreSlim decoderLock = new(1, 1);
         private readonly SemaphoreSlim seekLock = new SemaphoreSlim(1, 1);
 
-        private double durationMs = 0;
+        private VideoInfo videoInfo;
+        public VideoInfo VideoInfo => videoInfo;
 
         /// <summary>
         /// ファイルを開いて FFmpeg デコーダーを初期化
@@ -77,7 +79,23 @@ namespace CSharpFFPlayer
         public void OpenFile(string path)
         {
             decoder = new Decoder();
-            durationMs = decoder.OpenFile(path);
+            videoInfo = decoder.OpenFile(path);
+            rawFps = decoder.VideoStream.avg_frame_rate;
+            if (rawFps.num == 1000 && rawFps.den == 33)
+            {
+                videoFps.num = 30000;
+                videoFps.den = 1001;
+
+                fps = 29.97;
+            }
+            else
+            {
+                videoFps = rawFps;
+                fps = (double)videoFps.num / (double)videoFps.den;
+                fps = (double)videoFps.num / (double)videoFps.den;
+            }
+            videoInfo.VideoStreams.FirstOrDefault().Fps = fps;
+            baseFrameDurationMs = 1000.0 / fps;
             decoder.InitializeDecoders(false);
             playbackState = PlaybackState.Stopped;
         }
@@ -166,6 +184,7 @@ namespace CSharpFFPlayer
         /// </summary>
         public void Stop()
         {
+            Pause();
             playbackState = PlaybackState.Stopped;
 
             while (frames.TryDequeue(out var remainingFrame))
@@ -210,7 +229,7 @@ namespace CSharpFFPlayer
 
                 long target = ffmpeg.av_rescale_q(targetFrameIndex, rawFps, videoTimeBase);
                 long targetPts = ffmpeg.av_rescale_q(
-    targetFrameIndex,
+    targetFrameIndex -1,
     new AVRational { num = rawFps.den, den = rawFps.num }, // → 秒単位の time_base
     videoTimeBase
 );
@@ -298,7 +317,7 @@ namespace CSharpFFPlayer
                             continue;
                         }
 
-                        if (ptsFrameIndex.Value != targetFrameIndex)
+                        if (ptsFrameIndex.Value != targetFrameIndex -1)
                         {
                             Console.WriteLine($"[読み飛ばし] {ptsFrameIndex.Value}");
                             frame.Dispose();
@@ -319,6 +338,22 @@ namespace CSharpFFPlayer
 
                 frames.Enqueue(matchedFrame);
                 frameIndex = (int)GetFrameIndex(matchedFrame);
+
+                await transferLimiter.WaitAsync();
+                try
+                {
+                    unsafe { matchedFrame.GetCpuFrame(); }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[転送失敗] {ex.Message}");
+                }
+                finally
+                {
+                    transferLimiter.Release();
+                }
+
+                imageWriter.WriteFrame(matchedFrame, frameConveter);
                 Console.WriteLine($"[シーク完了] 実フレーム: {frameIndex}");
 
                 await decoderLock.WaitAsync();
@@ -476,11 +511,25 @@ namespace CSharpFFPlayer
 
         }
 
+        public double CalculateCurrentTimeMs(long currentFrame)
+        {
+            if (videoInfo == null || videoInfo.VideoStreams.Count == 0)
+                return 0;
 
+            var stream = videoInfo.VideoStreams[0]; // 最初の映像ストリームを使用
+            var timeBase = stream.TimeBase;
+
+            if (timeBase.Den == 0)
+                return 0;
+
+            // PTS = currentFrame * (time_base.num / time_base.den)
+            double seconds = currentFrame * ((double)timeBase.Num / timeBase.Den);
+            return seconds * 1000.0;
+        }
 
         public long GetTotalFrameCount()
         {
-            return (long)(fps * (durationMs / 1000.0));
+            return (long)(fps * (videoInfo.Duration.Milliseconds / 1000.0));
         }
 
 
@@ -494,21 +543,7 @@ namespace CSharpFFPlayer
 
             await WaitForBuffer();
 
-            rawFps = decoder.VideoStream.avg_frame_rate;
-            if (rawFps.num == 1000 && rawFps.den == 33)
-            {
-                videoFps.num = 30000;
-                videoFps.den = 1001;
-
-                fps = 29.97;
-            }
-            else
-            { 
-                videoFps = rawFps;
-                fps = (double)videoFps.num / (double)videoFps.den;
-                fps = (double)videoFps.num / (double)videoFps.den;
-            }
-            baseFrameDurationMs = 1000.0 / fps;
+            
             TimeSpan frameDuration = TimeSpan.FromMilliseconds(baseFrameDurationMs);
 
             playbackState = PlaybackState.Playing;
@@ -818,7 +853,7 @@ namespace CSharpFFPlayer
                 if (result == FrameReadResult.EndOfStream && !playbackState.Equals(PlaybackState.EndedStream))
                 {
                     Console.WriteLine("[EOF] 映像ストリームの終端を検出しました");
-                    playbackState = PlaybackState.EndedStream;
+                    playbackState = (playbackState != PlaybackState.SeekBuffering) ? PlaybackState.EndedStream : playbackState;
                 }
 
                 // ==== 転送処理 ====
