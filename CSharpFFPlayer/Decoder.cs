@@ -92,6 +92,7 @@ namespace CSharpFFPlayer
 
         public AVStream* AudioStreamPointer => audioStream;
 
+
         private unsafe AVCodec* TryGetHardwareDecoder(AVCodecID codecId, bool forceD3D11 = false)
         {
             if (forceD3D11 && (codecId == AVCodecID.AV_CODEC_ID_H264 || codecId == AVCodecID.AV_CODEC_ID_HEVC))
@@ -598,7 +599,8 @@ namespace CSharpFFPlayer
             }
         }
 
-
+        private long? firstVideoPts = null;
+        public long? FirstVideoPts => firstVideoPts;
         public unsafe (FrameReadResult result, ManagedFrame frame) TryReadFrame()
         {
             var frame = TryReadUnsafeFrame(out var result);
@@ -620,6 +622,12 @@ namespace CSharpFFPlayer
             // 受信に成功した場合
             if (receiveResult == 0)
             {
+                if (firstVideoPts == null && frame->pts != ffmpeg.AV_NOPTS_VALUE)
+                {
+                    firstVideoPts = frame->pts;
+                    Console.WriteLine($"[Info] 初回フレームの PTS = {firstVideoPts.Value}");
+                }
+
                 result = FrameReadResult.FrameAvailable;
                 return frame;
             }
@@ -635,6 +643,11 @@ namespace CSharpFFPlayer
                     receiveResult = ffmpeg.avcodec_receive_frame(videoCodecContext, frame);
                     if (receiveResult == 0)
                     {
+                        if (firstVideoPts == null && frame->pts != ffmpeg.AV_NOPTS_VALUE)
+                        {
+                            firstVideoPts = frame->pts;
+                            Console.WriteLine($"[Info] 初回フレームの PTS = {firstVideoPts.Value}");
+                        }
                         result = FrameReadResult.FrameAvailable;
                         return frame;
                     }

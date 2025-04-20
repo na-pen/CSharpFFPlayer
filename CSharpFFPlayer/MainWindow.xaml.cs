@@ -16,6 +16,7 @@ namespace CSharpFFPlayer
 {
     public partial class MainWindow : MahApps.Metro.Controls.MetroWindow, INotifyPropertyChanged
     {
+
         private VideoPlayController? _videoPlayController = null;
         private WriteableBitmap _writeableBitmap;
 
@@ -122,6 +123,7 @@ namespace CSharpFFPlayer
             }
         }
 
+
         /// <summary>
         /// 動画再生のためのビットマップやスライダーなどを初期化し、再生を開始
         /// </summary>
@@ -152,7 +154,22 @@ namespace CSharpFFPlayer
         private async void Window_KeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key == Key.Space)
+            { 
                 await TogglePlayPauseAsync();
+                return;
+            }
+
+            if (e.Key == Key.Right)
+            {
+                if (_videoPlayController != null)
+                {
+                    bool success = await _videoPlayController.StepForwardOneFrame();
+                    if (!success)
+                    {
+                        Console.WriteLine("次のフレームの取得に失敗しました。");
+                    }
+                }
+            }
         }
 
         /// <summary>
