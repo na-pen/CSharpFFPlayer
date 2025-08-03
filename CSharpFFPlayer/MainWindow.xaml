@@ -63,6 +63,30 @@
                     </MenuItem>
                 </mahApps:DropDownButton.Items>
             </mahApps:DropDownButton>
+
+            <mahApps:DropDownButton Content="エフェクト" Foreground="White">
+                <mahApps:DropDownButton.Items>
+
+                    <MenuItem Height="23" Click="KeyDown_Space">
+                        <MenuItem.Header>
+                            <TextBlock
+                    VerticalAlignment="Center"
+                    FontSize="13"
+                    Text="ポスタライズ"
+                    TextAlignment="Left" />
+                        </MenuItem.Header>
+                    </MenuItem>
+                    <MenuItem Height="23" Click="StopButton_Click">
+                        <MenuItem.Header>
+                            <TextBlock
+                    VerticalAlignment="Center"
+                    FontSize="13"
+                    Text="モノクロ"
+                    TextAlignment="Left" />
+                        </MenuItem.Header>
+                    </MenuItem>
+                </mahApps:DropDownButton.Items>
+            </mahApps:DropDownButton>
             <Button Content="settings" />
         </mahApps:WindowCommands>
     </mahApps:MetroWindow.LeftWindowCommands>

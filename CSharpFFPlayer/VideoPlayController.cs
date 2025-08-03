@@ -263,69 +263,94 @@ namespace CSharpFFPlayer
                 {
                     decoderLock.Release();
                 }
-
-                // ==== 映像バッファをクリア ====
-                int disposedFrames = 0;
-                while (frames.TryDequeue(out var oldFrame))
-                {
-                    oldFrame.Dispose();
-                    disposedFrames++;
-                }
-                Console.WriteLine($"[バッファ破棄] {disposedFrames} フレームを破棄");
-
                 // ==== フレーム読み飛ばし ====
                 const int maxSkip = 1000;
                 int skipped = 0;
+
+                // まず、既存バッファに目的のフレームがあるかを確認
                 ManagedFrame matchedFrame = null;
-
-                while (skipped++ < maxSkip)
+                Queue<ManagedFrame> tempQueue = new();
+                while (frames.TryDequeue(out var currentFrame))
                 {
-                    ManagedFrame frame = null;
-                    FrameReadResult readResult = FrameReadResult.FrameNotReady;
-
-                    for (int i = 0; i < 30; i++)
+                    var ptsFrameIndex = GetRawFrameIndex(currentFrame);
+                    if (ptsFrameIndex.HasValue && ptsFrameIndex.Value == targetFrameIndex - 1)
                     {
-                        await decoderLock.WaitAsync();
-                        try
+                        matchedFrame = currentFrame;
+                        break; // マッチしたら追加せず終了
+                    }
+                    tempQueue.Enqueue(currentFrame);
+                }
+
+                // 残りのフレームを戻す
+                while (tempQueue.Count > 0)
+                {
+                    frames.Enqueue(tempQueue.Dequeue());
+                }
+
+                await WaitForBuffer();
+
+                if (matchedFrame == null)
+                {
+                    // バッファ内に見つからなければ、バッファを破棄
+                    int disposedFrames = 0;
+                    while (frames.TryDequeue(out var oldFrame))
+                    {
+                        //Console.WriteLine($"[破棄] {GetRawFrameIndex(oldFrame)} フレームを破棄");
+                        oldFrame.Dispose();
+                        disposedFrames++;
+                    }
+                    Console.WriteLine($"[バッファ破棄] {disposedFrames} フレームを破棄");
+
+                    // 新たにフレームを探す
+                    while (skipped++ < maxSkip)
+                    {
+                        ManagedFrame frame = null;
+                        FrameReadResult readResult = FrameReadResult.FrameNotReady;
+
+                        for (int i = 0; i < 30; i++)
                         {
-                            (readResult, frame) = decoder.TryReadFrame();
-                        }
-                        finally
-                        {
-                            decoderLock.Release();
+                            await decoderLock.WaitAsync();
+                            try
+                            {
+                                (readResult, frame) = decoder.TryReadFrame();
+                            }
+                            finally
+                            {
+                                decoderLock.Release();
+                            }
+
+                            if (readResult == FrameReadResult.FrameAvailable || readResult == FrameReadResult.EndOfStream)
+                                break;
+
+                            await Task.Delay(10);
                         }
 
-                        if (readResult == FrameReadResult.FrameAvailable || readResult == FrameReadResult.EndOfStream)
+                        if (readResult == FrameReadResult.EndOfStream)
+                        {
+                            Console.WriteLine($"[シーク失敗] ストリーム終端に達しました（{skipped}/{targetFrameIndex}）");
+                            playbackState = PlaybackState.Paused;
+                            return false;
+                        }
+
+                        if (readResult == FrameReadResult.FrameAvailable)
+                        {
+                            var ptsFrameIndex = GetRawFrameIndex(frame);
+                            if (ptsFrameIndex == null)
+                            {
+                                frame.Dispose();
+                                continue;
+                            }
+
+                            if (ptsFrameIndex.Value != targetFrameIndex - 1)
+                            {
+                                Console.WriteLine($"[読み飛ばし] {ptsFrameIndex.Value}");
+                                frame.Dispose();
+                                continue;
+                            }
+
+                            matchedFrame = frame;
                             break;
-
-                        await Task.Delay(10);
-                    }
-
-                    if (readResult == FrameReadResult.EndOfStream)
-                    {
-                        Console.WriteLine($"[シーク失敗] ストリーム終端に達しました（{skipped}/{targetFrameIndex}）");
-                        playbackState = PlaybackState.Paused;
-                        return false;
-                    }
-
-                    if (readResult == FrameReadResult.FrameAvailable)
-                    {
-                        var ptsFrameIndex = GetRawFrameIndex(frame);
-                        if (ptsFrameIndex == null)
-                        {
-                            frame.Dispose();
-                            continue;
                         }
-
-                        if (ptsFrameIndex.Value != targetFrameIndex -1)
-                        {
-                            Console.WriteLine($"[読み飛ばし] {ptsFrameIndex.Value}");
-                            frame.Dispose();
-                            continue;
-                        }
-
-                        matchedFrame = frame;
-                        break;
                     }
                 }
 
@@ -509,6 +534,14 @@ namespace CSharpFFPlayer
             }
             return true;
 
+        }
+
+        public async Task<bool> FrameByFrame()
+        {
+            audioPlayer.Pause(true);
+            playbackState = PlaybackState.Paused;
+            bool result = await SeekToExactFrameAsync(frameIndex+2);
+            return result;
         }
 
         public double CalculateCurrentTimeMs(long currentFrame)

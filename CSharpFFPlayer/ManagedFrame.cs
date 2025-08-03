@@ -78,6 +78,11 @@ namespace CSharpFFPlayer
                 swFrame->height = frame->height;
                 swFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12;
 
+                swFrame->pts = frame->pts;
+                swFrame->pkt_dts = frame->pkt_dts;
+                swFrame->best_effort_timestamp = frame->best_effort_timestamp;
+
+
                 AVFrame* temp = frame;
                 ffmpeg.av_frame_free(&temp);
                 frame = null;
@@ -105,6 +110,11 @@ namespace CSharpFFPlayer
             dst->format = (int)AVPixelFormat.AV_PIX_FMT_NV12;
             dst->width = frame->width;
             dst->height = frame->height;
+
+            dst->pts = frame->pts;
+            dst->pkt_dts = frame->pkt_dts;
+            dst->best_effort_timestamp = frame->best_effort_timestamp;
+
 
             if (ffmpeg.av_frame_get_buffer(dst, 32) < 0)
             {

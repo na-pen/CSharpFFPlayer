@@ -1,7 +1,9 @@
 ﻿using FFmpeg.AutoGen;
 using System;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Media.Media3D;
 
 namespace CSharpFFPlayer
 {
@@ -54,6 +56,38 @@ namespace CSharpFFPlayer
                 if (expectedBytes > actualBytes)
                     throw new InvalidOperationException($"バッファサイズが不足しています。必要={expectedBytes}, 実際={actualBytes}");
                 frameConveter.ConvertFrameDirect(frame, bufferPtr);
+
+                // ==== ポスタリゼーション・2値化処理（BGR24対応） ====
+                int stride = writeableBitmap.BackBufferStride;
+                int width = writeableBitmap.PixelWidth;
+                int height = writeableBitmap.PixelHeight;
+                const int posterizeLevels = 4; // 例：4階調（64単位）
+                for (int y = 0; y < height; y++)
+                {
+                    byte* row = bufferPtr + y * stride;
+                    for (int x = 0; x < width; x++)
+                    {
+                        byte* pixel = row + x * 3; // BGR24 = 3バイト
+
+                        byte b = pixel[0];
+                        byte g = pixel[1];
+                        byte r = pixel[2];
+
+                        // --- ポスタリゼーション ---
+                        //r = (byte)((r / (256 / posterizeLevels)) * (256 / posterizeLevels));
+                        //g = (byte)((g / (256 / posterizeLevels)) * (256 / posterizeLevels));
+                        //b = (byte)((b / (256 / posterizeLevels)) * (256 / posterizeLevels));
+
+                        // --- 2値化（必要なら有効化） ---
+                         byte gray = (byte)(r * 0.299 + g * 0.587 + b * 0.114);
+                         byte bin = (gray >= 128) ? (byte)255 : (byte)0;
+                         r = g = b = bin;
+
+                        pixel[0] = b;
+                        pixel[1] = g;
+                        pixel[2] = r;
+                    }
+                }
 
                 // 更新領域を明示的に指定して再描画を通知
                 writeableBitmap.AddDirtyRect(rect);

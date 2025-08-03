@@ -145,14 +145,29 @@ namespace CSharpFFPlayer
             await _videoPlayController.Play();
         }
 
+        bool isSeeking = false;
 
         /// <summary>
         /// Space キーで再生・一時停止を切り替える
         /// </summary>
         private async void Window_KeyDown(object sender, KeyEventArgs e)
         {
-            if (e.Key == Key.Space)
+            if (e.Key == Key.Space && !isSeeking)
+            {
+                isSeeking = true;
                 await TogglePlayPauseAsync();
+                isSeeking = false;
+            }
+
+            else if (e.Key == Key.Right && !isSeeking)
+            {
+                if (_videoPlayController != null)
+                {
+                    isSeeking = true;
+                    await _videoPlayController.FrameByFrame();
+                    isSeeking = false;
+                }
+            }
         }
 
         /// <summary>
