@@ -1,16 +1,19 @@
 ﻿using CSharpFFPlayer;
 using Microsoft.WindowsAPICodePack.Dialogs;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-using System.ComponentModel;
+using static CSharpFFPlayer.Effect;
+using MahApps.Metro.Controls;
+
 
 namespace CSharpFFPlayer
 {
@@ -60,6 +63,13 @@ namespace CSharpFFPlayer
         public MainWindow()
         {
             InitializeComponent();
+
+            Loaded += MainWindow_Loaded;
+        }
+
+        private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            
         }
 
         private void ShowLoading(bool isVisible)
@@ -89,6 +99,17 @@ namespace CSharpFFPlayer
                 });
 
                 await InitializeAndStartVideo();
+
+                // 初期状態で「効果なし」にチェックを入れる
+                foreach (var item in EffectDropDownButton.Items.OfType<MenuItem>())
+                {
+                    if (item.Tag is EffectType effectType && effectType == EffectType.None)
+                    {
+                        item.IsChecked = true;
+                        _videoPlayController.currentEffect = EffectType.None;
+                        break;
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -314,6 +335,45 @@ namespace CSharpFFPlayer
                 await Task.Delay(100);
             }
         }
+
+
+
+        private void EffectMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            if (_videoPlayController != null)
+            {
+                if (sender is MenuItem clickedItem)
+                {
+                    if (clickedItem.Parent is ContextMenu contextMenu)
+                    {
+                        var clickedEffect = (EffectType)clickedItem.Tag;
+
+                        // クリックされた項目が現在選択中なら「None」に切り替える
+                        if (_videoPlayController.currentEffect == clickedEffect && clickedItem.IsChecked)
+                        {
+                            // チェックを外して None に
+                            clickedItem.IsChecked = false;
+                            _videoPlayController.currentEffect = EffectType.None;
+                        }
+                        else
+                        {
+                            // それ以外は排他でチェック切り替え
+                            foreach (var item in contextMenu.Items.OfType<MenuItem>())
+                            {
+                                item.IsChecked = false;
+                            }
+                            clickedItem.IsChecked = true;
+                            _videoPlayController.currentEffect = clickedEffect;
+                        }
+
+                        // エフェクト適用
+                        //Effect.Apply(currentEffect);
+                    }
+                }
+            }
+        }
+
+
 
 
         /// <summary>

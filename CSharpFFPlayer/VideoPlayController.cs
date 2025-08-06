@@ -28,6 +28,7 @@ namespace CSharpFFPlayer
         Ended
     }
 
+
     public class VideoPlayController
     {
 
@@ -43,6 +44,8 @@ namespace CSharpFFPlayer
         public bool IsSeeking => playbackState == PlaybackState.Seeking;
         public bool IsBuffering => playbackState == PlaybackState.Buffering;
         public bool IsEnded => playbackState == PlaybackState.Ended;
+
+        public EffectType currentEffect = EffectType.None;
 
         private MemoryStream audioStream = new MemoryStream();
         private readonly object audioLock = new object();
@@ -378,7 +381,7 @@ namespace CSharpFFPlayer
                     transferLimiter.Release();
                 }
 
-                imageWriter.WriteFrame(matchedFrame, frameConveter);
+                imageWriter.WriteFrame(matchedFrame, frameConveter,currentEffect);
                 Console.WriteLine($"[シーク完了] 実フレーム: {frameIndex}");
 
                 await decoderLock.WaitAsync();
@@ -655,7 +658,7 @@ namespace CSharpFFPlayer
 
                     stopwatch.Restart();
 
-                    imageWriter.WriteFrame(frame, frameConveter);
+                    imageWriter.WriteFrame(frame, frameConveter, currentEffect);
 
                     long? ptsFrameIndex = GetFrameIndex(frame);
                     if (ptsFrameIndex != null)

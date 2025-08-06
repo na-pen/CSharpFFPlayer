@@ -14,6 +14,7 @@ namespace CSharpFFPlayer
     {
         private readonly Int32Rect rect;
         private readonly WriteableBitmap writeableBitmap;
+        private Effect _effect = new();
 
         /// <summary>
         /// 描画領域と WriteableBitmap を初期化する。
@@ -35,7 +36,7 @@ namespace CSharpFFPlayer
         /// </summary>
         /// <param name="frame">描画するフレーム（デコード済み）</param>
         /// <param name="frameConveter">YUV→RGB 変換コンバータ</param>
-        public unsafe void WriteFrame(ManagedFrame frame, FrameConveter frameConveter)
+        public unsafe void WriteFrame(ManagedFrame frame, FrameConveter frameConveter,EffectType effect)
         {
             // 引数の null チェック
             if (frame == null)
@@ -57,35 +58,21 @@ namespace CSharpFFPlayer
                     throw new InvalidOperationException($"バッファサイズが不足しています。必要={expectedBytes}, 実際={actualBytes}");
                 frameConveter.ConvertFrameDirect(frame, bufferPtr);
 
-                // ==== ポスタリゼーション・2値化処理（BGR24対応） ====
-                int stride = writeableBitmap.BackBufferStride;
-                int width = writeableBitmap.PixelWidth;
-                int height = writeableBitmap.PixelHeight;
-                const int posterizeLevels = 4; // 例：4階調（64単位）
-                for (int y = 0; y < height; y++)
+                //エフェクトの指定があれば、ビットマップに対して画像処理をかける　　　
+                if (effect != EffectType.None)
                 {
-                    byte* row = bufferPtr + y * stride;
-                    for (int x = 0; x < width; x++)
+                    int stride = writeableBitmap.BackBufferStride;
+                    int width = writeableBitmap.PixelWidth;
+                    int height = writeableBitmap.PixelHeight;
+
+                    switch (effect)
                     {
-                        byte* pixel = row + x * 3; // BGR24 = 3バイト
-
-                        byte b = pixel[0];
-                        byte g = pixel[1];
-                        byte r = pixel[2];
-
-                        // --- ポスタリゼーション ---
-                        //r = (byte)((r / (256 / posterizeLevels)) * (256 / posterizeLevels));
-                        //g = (byte)((g / (256 / posterizeLevels)) * (256 / posterizeLevels));
-                        //b = (byte)((b / (256 / posterizeLevels)) * (256 / posterizeLevels));
-
-                        // --- 2値化（必要なら有効化） ---
-                         byte gray = (byte)(r * 0.299 + g * 0.587 + b * 0.114);
-                         byte bin = (gray >= 128) ? (byte)255 : (byte)0;
-                         r = g = b = bin;
-
-                        pixel[0] = b;
-                        pixel[1] = g;
-                        pixel[2] = r;
+                        case EffectType.Posterize:
+                            _effect.ApplyPosterize(bufferPtr, stride, width, height);
+                            break;
+                        case EffectType.Monochrome:
+                            _effect.ApplyMonochrome(bufferPtr, stride, width, height);
+                            break;
                     }
                 }
 

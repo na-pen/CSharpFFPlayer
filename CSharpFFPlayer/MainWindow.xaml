@@ -64,29 +64,40 @@
                 </mahApps:DropDownButton.Items>
             </mahApps:DropDownButton>
 
-            <mahApps:DropDownButton Content="エフェクト" Foreground="White">
+            <mahApps:DropDownButton x:Name="EffectDropDownButton" Content="エフェクト" Foreground="White">
                 <mahApps:DropDownButton.Items>
-
-                    <MenuItem Height="23" Click="KeyDown_Space">
+                    <MenuItem Height="23" IsCheckable="True" Tag="{x:Static local:EffectType.None}" Click="EffectMenuItem_Click">
                         <MenuItem.Header>
                             <TextBlock
-                    VerticalAlignment="Center"
-                    FontSize="13"
-                    Text="ポスタライズ"
-                    TextAlignment="Left" />
+VerticalAlignment="Center"
+FontSize="13"
+Text="効果なし"
+TextAlignment="Left" />
                         </MenuItem.Header>
                     </MenuItem>
-                    <MenuItem Height="23" Click="StopButton_Click">
+                    <MenuItem Height="23" IsCheckable="True" Tag="{x:Static local:EffectType.Posterize}" Click="EffectMenuItem_Click">
                         <MenuItem.Header>
                             <TextBlock
-                    VerticalAlignment="Center"
-                    FontSize="13"
-                    Text="モノクロ"
-                    TextAlignment="Left" />
+        VerticalAlignment="Center"
+        FontSize="13"
+        Text="ポスタライズ"
+        TextAlignment="Left" />
+                        </MenuItem.Header>
+                    </MenuItem>
+                    <MenuItem Height="23" IsCheckable="True" Tag="{x:Static local:EffectType.Monochrome}" Click="EffectMenuItem_Click">
+                        <MenuItem.Header>
+                            <TextBlock
+VerticalAlignment="Center"
+FontSize="13"
+Text="モノクロ"
+TextAlignment="Left" />
                         </MenuItem.Header>
                     </MenuItem>
                 </mahApps:DropDownButton.Items>
             </mahApps:DropDownButton>
+
+
+
             <Button Content="settings" />
         </mahApps:WindowCommands>
     </mahApps:MetroWindow.LeftWindowCommands>
