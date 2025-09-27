@@ -1,101 +1,97 @@
 ﻿using FFmpeg.AutoGen;
 using System;
+using System.Collections.Concurrent;
 using System.Windows;
 using System.Windows.Media.Imaging;
 
 namespace CSharpFFPlayer
 {
-    /// <summary>
-    /// デコード済みフレームを WPF の WriteableBitmap に描画するクラス。
-    /// </summary>
-    public class ImageWriter
+    public class ImageWriter : IDisposable
     {
-        private readonly Int32Rect rect;
         private readonly WriteableBitmap writeableBitmap;
+        private readonly Int32Rect rect;
+        private readonly FrameConveter frameConveter;
 
-        /// <summary>
-        /// 描画領域と WriteableBitmap を初期化する。
-        /// </summary>
-        /// <param name="width">描画領域の幅</param>
-        /// <param name="height">描画領域の高さ</param>
-        /// <param name="writeableBitmap">描画先の WriteableBitmap</param>
-        public ImageWriter(int width, int height, WriteableBitmap writeableBitmap)
+        private readonly ConcurrentQueue<ManagedFrame> renderQueue = new();
+        private bool isRenderPending = false; // UIスレッドに描画要求を出したかどうか
+
+        public ImageWriter(int width, int height, WriteableBitmap writeableBitmap, FrameConveter frameConveter)
         {
-            if (writeableBitmap == null)
-                throw new ArgumentNullException(nameof(writeableBitmap), "描画先の WriteableBitmap が null です");
+            this.writeableBitmap = writeableBitmap ?? throw new ArgumentNullException(nameof(writeableBitmap));
+            this.frameConveter = frameConveter ?? throw new ArgumentNullException(nameof(frameConveter));
 
             rect = new Int32Rect(0, 0, width, height);
-            this.writeableBitmap = writeableBitmap;
+            frameConveter.SetDestinationStride(writeableBitmap.BackBufferStride);
         }
 
         /// <summary>
-        /// デコード済みのフレームを WriteableBitmap に描画する。
+        /// フレーム到着時に即描画要求を出す
         /// </summary>
-        /// <param name="frame">描画するフレーム（デコード済み）</param>
-        /// <param name="frameConveter">YUV→RGB 変換コンバータ</param>
-        public unsafe void WriteFrame(ManagedFrame frame, FrameConveter frameConveter)
+        public void EnqueueFrame(ManagedFrame newFrame)
         {
-            // 引数の null チェック
-            if (frame == null)
-                throw new ArgumentNullException(nameof(frame), "フレームが null です");
+            // 古いフレームを破棄して最新のみ保持
+            while (renderQueue.TryDequeue(out var old))
+                old.Dispose();
 
-            if (frameConveter == null)
-                throw new ArgumentNullException(nameof(frameConveter), "フレーム変換器が null です");
+            renderQueue.Enqueue(newFrame);
 
-            // WriteableBitmap のロックを行い、バッファポインタを取得
-            writeableBitmap.Lock();
-            try
+            // UIスレッドに描画要求（多重呼び出し防止）
+            if (!isRenderPending)
             {
-                // バッファポインタを取得して、YUV→RGB 変換描画を行う
-                byte* bufferPtr = (byte*)writeableBitmap.BackBuffer.ToPointer();
-                int expectedBytes = frameConveter.ExpectedBufferSize(); // ← 後述
-                int actualBytes = writeableBitmap.BackBufferStride * writeableBitmap.PixelHeight;
-
-                if (expectedBytes > actualBytes)
-                    throw new InvalidOperationException($"バッファサイズが不足しています。必要={expectedBytes}, 実際={actualBytes}");
-                frameConveter.ConvertFrameDirect(frame, bufferPtr);
-
-                // 更新領域を明示的に指定して再描画を通知
-                writeableBitmap.AddDirtyRect(rect);
-            }
-            finally
-            {
-                // アンロック処理は必ず実行する
-                writeableBitmap.Unlock();
+                isRenderPending = true;
+                Application.Current.Dispatcher.BeginInvoke(
+                    new Action(RenderLatestFrame),
+                    System.Windows.Threading.DispatcherPriority.Render
+                );
             }
         }
 
-        /// <summary>
-        /// デコード済みのフレームを WriteableBitmap に描画する。
-        /// </summary>
-        /// <param name="frame">描画するフレーム（デコード済み）</param>
-        /// <param name="frameConveter">YUV→RGB 変換コンバータ</param>
-        public unsafe void WriteFrame(AVFrame* frame, FrameConveter frameConveter)
+        private void RenderLatestFrame()
         {
-            // 引数の null チェック
-            if (frame == null)
-                throw new ArgumentNullException(nameof(frame), "フレームが null です");
+            isRenderPending = false;
 
-            if (frameConveter == null)
-                throw new ArgumentNullException(nameof(frameConveter), "フレーム変換器が null です");
+            if (!renderQueue.TryDequeue(out var latest))
+                return;
 
-            // WriteableBitmap のロックを行い、バッファポインタを取得
-            writeableBitmap.Lock();
             try
             {
-                // バッファポインタを取得して、YUV→RGB 変換描画を行う
-                byte* bufferPtr = (byte*)writeableBitmap.BackBuffer.ToPointer();
-                frameConveter.ConvertFrameDirect(frame, bufferPtr);
+                if (latest.IsGpuFrame)
+                {
+                    unsafe { latest.GetCpuFrame(); }
+                    unsafe { if (latest.Frame == null) return; }
+                }
 
-                // 更新領域を明示的に指定して再描画を通知
-                writeableBitmap.AddDirtyRect(rect);
+                writeableBitmap.Lock();
+                unsafe
+                {
+                    byte* bufferPtr = (byte*)writeableBitmap.BackBuffer.ToPointer();
+                    frameConveter.ConvertFrameDirect(latest, bufferPtr);
+                    writeableBitmap.AddDirtyRect(rect);
+                }
             }
             finally
             {
-                // アンロック処理は必ず実行する
                 writeableBitmap.Unlock();
-            }
+                latest.Dispose();
 
+                // もし描画中に次のフレームが届いていたらもう一度呼ぶ
+                if (!renderQueue.IsEmpty)
+                    Application.Current.Dispatcher.BeginInvoke(
+                        new Action(RenderLatestFrame),
+                        System.Windows.Threading.DispatcherPriority.Render
+                    );
+            }
+        }
+
+        public void ClearQueue()
+        {
+            while (renderQueue.TryDequeue(out var frame))
+                frame.Dispose();
+        }
+
+        public void Dispose()
+        {
+            ClearQueue();
         }
     }
 }

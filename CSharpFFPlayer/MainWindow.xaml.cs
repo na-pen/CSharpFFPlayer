@@ -133,17 +133,28 @@ namespace CSharpFFPlayer
             int dpiX = (int)Math.Round(96 / matrix.M11);
             int dpiY = (int)Math.Round(96 / matrix.M22);
 
-            _writeableBitmap = _videoPlayController.CreateBitmap(dpiX, dpiY);
+            // ★ CreateBitmapAsync は async メソッドなので必ず await する
+            _writeableBitmap = await _videoPlayController.CreateBitmapAsync(dpiX, dpiY);
+
+            // ★ await 完了後に UI にセット
             VideoImage.Source = _writeableBitmap;
 
+            // ★ 総再生時間を正しく表示
             TimeSpan total = _videoPlayController.VideoInfo.Duration.ToTimeSpan();
             TotalDurationDisplay = FormatTime(total);
+
             ShowLoading(false);
+
+            // シークバー更新ループ開始
             _ = UpdateSeekSliderLoopAsync();
+
+            // ウィンドウタイトルにファイル名を表示
             this.Title = Path.GetFileName(_videoPlayController.VideoInfo.FilePath);
 
+            // 再生開始
             await _videoPlayController.Play();
         }
+
 
 
         /// <summary>

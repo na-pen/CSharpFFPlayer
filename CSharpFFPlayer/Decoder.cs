@@ -682,6 +682,20 @@ namespace CSharpFFPlayer
             throw new Exception($"avcodec_receive_frame failed: {receiveResult}");
         }
 
+        // Decoder 内に追加
+        public void ClearInternalQueues()
+        {
+            lock (sendPackedSyncObject)
+            {
+                while (videoPackets.Count > 0)
+                    videoPackets.Dequeue()?.Dispose();
+                while (audioPackets.Count > 0)
+                    audioPackets.Dequeue()?.Dispose();
+
+                isVideoFrameEnded = false;
+                isAudioFrameEnded = false;
+            }
+        }
 
         public static unsafe AVFrame* ConvertToYUV420P(AVFrame* src)
         {

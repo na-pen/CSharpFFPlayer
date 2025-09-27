@@ -1,208 +1,117 @@
 ﻿using FFmpeg.AutoGen;
-using System;
-using System.Runtime.InteropServices;
 
-namespace CSharpFFPlayer
+public unsafe class ManagedFrame : IDisposable
 {
+    private AVFrame* frame;
+    private bool isDisposed;
+
+    public ManagedFrame(AVFrame* frame) { this.frame = frame; }
+
+    public AVFrame* Frame => frame;
+
+    private readonly object transferLock = new();
+    private volatile bool isGpuFrame = true;
+    public bool IsGpuFrame => isGpuFrame;
+
+    public long Index = -1;
+
     /// <summary>
-    /// AVFrame を安全に管理し、必要に応じて GPU → CPU 転送を行うラッパークラスです。
+    /// GPUフレームならCPUへ転送する。既にCPUなら何もしない。
+    /// 成功: true / 失敗: false
     /// </summary>
-    public unsafe class ManagedFrame : IDisposable
+    public bool GetCpuFrame()
     {
-        private AVFrame* frame;
-        private bool isDisposed;
+        if (frame == null) return false;
 
-        /// <summary>
-        /// 指定された AVFrame をラップして管理します。
-        /// </summary>
-        /// <param name="frame">管理対象の AVFrame*</param>
-        public ManagedFrame(AVFrame* frame)
+        // すでにCPUなら即true
+        if (!isGpuFrame)
+            return true;
+
+        lock (transferLock)
         {
-            this.frame = frame;
-        }
+            if (frame == null) return false;
+            if (!isGpuFrame) return true;
 
-        /// <summary>
-        /// 内部のオリジナルフレーム（GPU or CPU）を取得します。
-        /// </summary>
-        public AVFrame* Frame => frame;
+            var pixFmt = (AVPixelFormat)frame->format;
+            bool isGPU =
+                pixFmt == AVPixelFormat.AV_PIX_FMT_D3D11 ||
+                pixFmt == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD ||
+                pixFmt == AVPixelFormat.AV_PIX_FMT_QSV ||
+                pixFmt == AVPixelFormat.AV_PIX_FMT_CUDA ||
+                pixFmt == AVPixelFormat.AV_PIX_FMT_VAAPI;
 
-        private readonly object transferLock = new(); //disposeとCPU転送が同時に呼ばれることを防ぐ
-        private volatile bool isGpuFrame = true; //GPUフレームかどうか
-        public bool IsGpuFrame => isGpuFrame;
-
-        /// <summary>
-        /// CPU 上に転送済みのフレームを取得します。
-        /// 既に CPU 上ならそのまま返します。未転送の場合は転送を行います。
-        /// </summary>
-        public void GetCpuFrame()
-        {
-            // GPUでなければロック不要（高速パス）
-            if (!isGpuFrame || frame == null)
-                return;
-
-            lock (transferLock)
+            if (!isGPU)
             {
-                if (frame == null) return;
-                if (frame == null)
-                    return;
-
-                AVPixelFormat pixFmt = (AVPixelFormat)frame->format;
-
-                bool isGPU = pixFmt == AVPixelFormat.AV_PIX_FMT_D3D11 ||
-                             pixFmt == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD ||
-                             pixFmt == AVPixelFormat.AV_PIX_FMT_QSV ||
-                             pixFmt == AVPixelFormat.AV_PIX_FMT_CUDA ||
-                             pixFmt == AVPixelFormat.AV_PIX_FMT_VAAPI;
-
-                if (!isGPU)
-                {
-                    // 既にCPU上
-                    isGpuFrame = false;
-                    return;
-                }
-
-                AVFrame* swFrame = ffmpeg.av_frame_alloc();
-                if (swFrame == null)
-                    throw new InvalidOperationException("CPUフレーム用バッファの確保に失敗しました。");
-
-                int ret = ffmpeg.av_hwframe_transfer_data(swFrame, frame, 0);
-                if (ret < 0)
-                {
-                    ffmpeg.av_frame_free(&swFrame);
-                    var errbuf = stackalloc byte[1024];
-                    ffmpeg.av_strerror(ret, errbuf, 1024);
-                    throw new InvalidOperationException($"GPUフレームからCPUへの転送に失敗しました: {Marshal.PtrToStringAnsi((nint)errbuf)}");
-                }
-
-                swFrame->width = frame->width;
-                swFrame->height = frame->height;
-                swFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12;
-
-                AVFrame* temp = frame;
-                ffmpeg.av_frame_free(&temp);
-                frame = null;
-                this.frame = swFrame;
-                isGpuFrame = false; // 転送完了後にフラグを更新
-
-                ConvertToNV12Self(); //フォーマット変換
-            }
-        }
-
-
-        private void ConvertToNV12Self()
-        {
-            if (frame == null)
-                throw new InvalidOperationException("変換対象フレームが null です。");
-
-            AVPixelFormat currentFormat = (AVPixelFormat)frame->format;
-            if (currentFormat == AVPixelFormat.AV_PIX_FMT_NV12)
-                return;
-
-            AVFrame* dst = ffmpeg.av_frame_alloc();
-            if (dst == null)
-                throw new Exception("出力フレームの確保に失敗しました。");
-
-            dst->format = (int)AVPixelFormat.AV_PIX_FMT_NV12;
-            dst->width = frame->width;
-            dst->height = frame->height;
-
-            if (ffmpeg.av_frame_get_buffer(dst, 32) < 0)
-            {
-                ffmpeg.av_frame_free(&dst);
-                throw new Exception("出力フレームバッファの確保に失敗しました。");
+                // 元からCPU
+                isGpuFrame = false;
+                return true;
             }
 
-            SwsContext* sws = ffmpeg.sws_getContext(
-                frame->width, frame->height, currentFormat,
-                dst->width, dst->height, AVPixelFormat.AV_PIX_FMT_NV12,
-                1, null, null, null);
+            // HW→SW 転送
+            AVFrame* swFrame = ffmpeg.av_frame_alloc();
+            if (swFrame == null)
+                return false;
 
-            if (sws == null)
+            int ret = ffmpeg.av_hwframe_transfer_data(swFrame, frame, 0);
+            if (ret < 0)
             {
-                ffmpeg.av_frame_free(&dst);
-                throw new Exception("スケーラコンテキストの作成に失敗しました。");
+                ffmpeg.av_frame_free(&swFrame);
+                return false;
             }
 
-            int ret = ffmpeg.sws_scale(
-                sws,
-                frame->data,
-                frame->linesize,
-                0,
-                frame->height,
-                dst->data,
-                dst->linesize);
+            // サイズ・タイミングの補完（転送で埋まっていることが多いが防御的に）
+            swFrame->width = frame->width;
+            swFrame->height = frame->height;
+            swFrame->pts = (frame->pts != ffmpeg.AV_NOPTS_VALUE) ? frame->pts : frame->best_effort_timestamp;
 
-            ffmpeg.sws_freeContext(sws);
+            // 重要: ここで swFrame->format を「勝手に」書き換えない！
+            // hw_frames_ctx->sw_format が正です。描画側で srcFormat に合わせて変換してください。
 
-            if (ret <= 0)
+            // 旧フレームを解放して置き換え
+            AVFrame* old = frame;
+            ffmpeg.av_frame_free(&old);
+            frame = swFrame;
+
+            isGpuFrame = false;
+            return true;
+        }
+    }
+
+    ~ManagedFrame() { Dispose(false); }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
+    {
+        lock (transferLock)
+        {
+            if (isDisposed) return;
+            if (frame != null)
             {
-                ffmpeg.av_frame_free(&dst);
-                throw new Exception("sws_scale による NV12 変換に失敗しました。");
-            }
-
-            // 安全な上書き：中身をコピーし、dst のみ解放
-            ffmpeg.av_frame_unref(frame); // 古い中身を解放
-            *frame = *dst;                // 中身をコピー（メモリ所有権は frame が持つ）
-            ffmpeg.av_frame_free(&dst);   // dst 本体を破棄（中身はコピー済み）
-        }
-
-
-
-        /// <summary>
-        /// デストラクタ。Dispose が呼ばれていない場合に AVFrame を解放します。
-        /// </summary>
-        ~ManagedFrame()
-        {
-            Dispose(false);
-        }
-
-        /// <summary>
-        /// AVFrame を解放します。
-        /// </summary>
-        public void Dispose()
-        {
-            Dispose(true);
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Dispose パターンに従ってリソースを解放します。
-        /// </summary>
-        /// <param name="disposing">マネージドリソースも解放するか（未使用）</param>
-        private void Dispose(bool disposing)
-        {
-            lock (transferLock)
-            {
-                if (isDisposed) return;
-
-                // 二重解放防止
-                if (frame != null)
-                {
-                    try
+                try
+                { 
+                    fixed (AVFrame** framePtr = &frame) 
                     {
-                        // 明示的に固定して解放
-                        fixed (AVFrame** framePtr = &frame)
-                        {
-                            ffmpeg.av_frame_free(framePtr);
-                        }
-
-                        frame = null;
-                    }
-                    catch (AccessViolationException ex)
-                    {
-                        Console.WriteLine($"[Dispose Error] AVFrame 解放中にアクセス違反: {ex.Message}");
-                        frame = null;
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[Dispose Error] 例外: {ex.Message}");
-                        frame = null;
-                    }
+                        ffmpeg.av_frame_free(framePtr);
+                    } 
+                    frame = null; 
                 }
-
-                isDisposed = true;
+                catch (AccessViolationException ex) 
+                { 
+                    Console.WriteLine($"[Dispose Error] AVFrame 解放中にアクセス違反: {ex.Message}");
+                    frame = null; 
+                }
+                catch (Exception ex) 
+                { 
+                    Console.WriteLine($"[Dispose Error] 例外: {ex.Message}");
+                    frame = null; 
+                }
             }
+            isDisposed = true;
         }
-
     }
 }
