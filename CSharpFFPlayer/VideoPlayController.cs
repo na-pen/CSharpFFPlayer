@@ -108,7 +108,7 @@ namespace CSharpFFPlayer
 
             videoInfo.VideoStreams.FirstOrDefault().Fps = fps;
             baseFrameDurationMs = 1000.0f / fps;
-            decoder.InitializeDecoders(false);
+            decoder.InitializeDecoders();
             playbackState = PlaybackState.Stopped;
         }
 

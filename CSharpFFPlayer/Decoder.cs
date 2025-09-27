@@ -92,14 +92,38 @@ namespace CSharpFFPlayer
 
         public AVStream* AudioStreamPointer => audioStream;
 
-        private unsafe AVCodec* TryGetHardwareDecoder(AVCodecID codecId, bool forceD3D11 = false)
+        private unsafe AVCodec* TryGetHardwareDecoder(AVCodecID codecId)
         {
-            if (forceD3D11 && (codecId == AVCodecID.AV_CODEC_ID_H264 || codecId == AVCodecID.AV_CODEC_ID_HEVC))
+            Console.WriteLine("[Info] 利用可能なハードウェアデバイス一覧:");
+            AVHWDeviceType type = AVHWDeviceType.AV_HWDEVICE_TYPE_NONE;
+            while ((type = ffmpeg.av_hwdevice_iterate_types(type)) != AVHWDeviceType.AV_HWDEVICE_TYPE_NONE)
             {
-                Console.WriteLine("[Info] D3D11VA 使用を強制。ソフトウェアデコーダを返します。");
-                return ffmpeg.avcodec_find_decoder(codecId);
+                Console.WriteLine($"  - {type}");
             }
 
+            // まず D3D11VA デコーダを探す
+            string d3d11DecoderName = codecId switch
+            {
+                AVCodecID.AV_CODEC_ID_H264 => "h264_d3d11va",
+                AVCodecID.AV_CODEC_ID_HEVC => "hevc_d3d11va",
+                _ => null
+            };
+
+            if (d3d11DecoderName != null)
+            {
+                AVCodec* d3d11Codec = ffmpeg.avcodec_find_decoder_by_name(d3d11DecoderName);
+                if (d3d11Codec != null)
+                {
+                    Console.WriteLine($"[Info] D3D11VA デコーダを使用します: {d3d11DecoderName}");
+                    return d3d11Codec;
+                }
+                else
+                {
+                    Console.WriteLine($"[Warn] D3D11VA デコーダ {d3d11DecoderName} が見つかりません。フォールバックします。");
+                }
+            }
+
+            // それ以外は従来どおり GPU ベンダー別に選択
             bool hasNvidia = false, hasIntel = false, hasAMD = false;
 
             try
@@ -118,16 +142,15 @@ namespace CSharpFFPlayer
                 Console.WriteLine($"[Warn] GPU検出に失敗しました。ハードウェアデコーダの選択をスキップします: {ex.Message}");
             }
 
-            // GPUベンダー別のデコーダ名を決定
             (bool available, string? decoderName)[] candidates = new[]
             {
-                (hasNvidia, codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_cuvid" :
-                    codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_cuvid" : null),
-                (hasIntel,  codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_qsv"   :
-                    codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_qsv"   : null),
-                (hasAMD,    codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_amf"   :
-                    codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_amf"   : null),
-            };
+        (hasNvidia, codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_cuvid" :
+            codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_cuvid" : null),
+        (hasIntel,  codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_qsv"   :
+            codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_qsv"   : null),
+        (hasAMD,    codecId == AVCodecID.AV_CODEC_ID_H264 ? "h264_amf"   :
+            codecId == AVCodecID.AV_CODEC_ID_HEVC ? "hevc_amf"   : null),
+    };
 
             foreach (var (available, name) in candidates)
             {
@@ -142,10 +165,13 @@ namespace CSharpFFPlayer
                 }
             }
 
+            // 最終手段: ソフトウェアデコーダ
             AVCodec* fallback = ffmpeg.avcodec_find_decoder(codecId);
-            Console.WriteLine($"[Info] ハードウェアデコーダ未使用。ソフトウェアデコーダを使用します: {ffmpeg.avcodec_get_name(codecId)}");
+            Console.WriteLine($"[Info] ソフトウェアデコーダを使用します: {ffmpeg.avcodec_get_name(codecId)}");
             return fallback;
         }
+
+
 
         public unsafe AVFrame* TransferFrameToCPU(AVFrame* hwFrame)
         {
@@ -358,12 +384,11 @@ namespace CSharpFFPlayer
         /// <summary>
         /// 映像・音声デコーダの初期化を行います。必要に応じてハードウェアデコードを使用します。
         /// </summary>
-        /// <param name="forceD3D11">D3D11VAを強制するかどうか。</param>
-        public unsafe void InitializeDecoders(bool forceD3D11 = false)
+        public unsafe void InitializeDecoders()
         {
             if (videoStream is not null && videoCodecContext == null)
             {
-                videoCodec = TryGetHardwareDecoder(videoStream->codecpar->codec_id, forceD3D11);
+                videoCodec = TryGetHardwareDecoder(videoStream->codecpar->codec_id);
                 if (videoCodec == null)
                     throw new InvalidOperationException("対応する映像デコーダが見つかりません。");
 
@@ -374,17 +399,17 @@ namespace CSharpFFPlayer
                 ffmpeg.avcodec_parameters_to_context(videoCodecContext, videoStream->codecpar)
                     .OnError(() => throw new InvalidOperationException("映像コーデックパラメータの適用に失敗しました。"));
 
-                // ハードウェアデコーダの種類を判別
+                // ★ ハードウェアデコーダの種類を判別
                 string? codecName = Marshal.PtrToStringAnsi((nint)videoCodec->name);
                 videoHardwareType = codecName switch
                 {
-                    not null when codecName.Contains("d3d11va") || forceD3D11 => AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA,
+                    not null when codecName.Contains("d3d11va") => AVHWDeviceType.AV_HWDEVICE_TYPE_D3D11VA,
                     not null when codecName.Contains("qsv") => AVHWDeviceType.AV_HWDEVICE_TYPE_QSV,
                     not null when codecName.Contains("cuda") || codecName.Contains("cuvid") => AVHWDeviceType.AV_HWDEVICE_TYPE_CUDA,
                     _ => null
                 };
 
-                // ハードウェアコンテキストの初期化
+                // ★ ハードウェアコンテキストの初期化
                 if (videoHardwareType is AVHWDeviceType hwType)
                 {
                     AVBufferRef* hw_device_ctx = null;
@@ -392,16 +417,17 @@ namespace CSharpFFPlayer
                     if (result >= 0)
                     {
                         videoCodecContext->hw_device_ctx = ffmpeg.av_buffer_ref(hw_device_ctx);
-                        Console.WriteLine($"ハードウェアデコード使用中: {hwType}");
+                        Console.WriteLine($"[Info] ハードウェアデコード使用中: {hwType}");
                     }
                     else
                     {
                         // 初期化失敗時はソフトウェアにフォールバック
                         var errbuf = stackalloc byte[1024];
                         ffmpeg.av_strerror(result, errbuf, 1024);
-                        Console.WriteLine($"ハードウェアデバイス {hwType} の初期化に失敗: {Marshal.PtrToStringAnsi((nint)errbuf)}");
-                        Console.WriteLine("ソフトウェアデコードへ切り替えます。");
+                        Console.WriteLine($"[Warn] ハードウェアデバイス {hwType} の初期化に失敗: {Marshal.PtrToStringAnsi((nint)errbuf)}");
+                        Console.WriteLine("[Info] ソフトウェアデコードにフォールバックします。");
 
+                        // ソフトウェアデコーダに切り替え
                         videoCodec = ffmpeg.avcodec_find_decoder(videoStream->codecpar->codec_id);
                         videoCodecContext = ffmpeg.avcodec_alloc_context3(videoCodec);
                         ffmpeg.avcodec_parameters_to_context(videoCodecContext, videoStream->codecpar);
@@ -949,6 +975,8 @@ namespace CSharpFFPlayer
 
 
     }
+
+
 
 
 
