@@ -215,47 +215,6 @@ namespace CSharpFFPlayer
             Console.WriteLine($"[Info] ソフトウェアデコーダを使用します: {ffmpeg.avcodec_get_name(codecId)}");
             return fallback;
         }
-
-
-
-        public unsafe AVFrame* TransferFrameToCPU(AVFrame* hwFrame)
-        {
-            if (hwFrame == null)
-                return null;
-
-            AVPixelFormat pixFmt = (AVPixelFormat)hwFrame->format;
-
-            bool isGPUFormat = pixFmt == AVPixelFormat.AV_PIX_FMT_D3D11 ||
-                               pixFmt == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD ||
-                               pixFmt == AVPixelFormat.AV_PIX_FMT_QSV ||
-                               pixFmt == AVPixelFormat.AV_PIX_FMT_CUDA ||
-                               pixFmt == AVPixelFormat.AV_PIX_FMT_VAAPI;
-
-            if (!isGPUFormat)
-                return hwFrame; // GPUフレームでなければそのまま返す
-
-            AVFrame* swFrame = ffmpeg.av_frame_alloc();
-            if (swFrame == null)
-                throw new InvalidOperationException("CPUフレーム用のバッファ確保に失敗しました。");
-
-            int err = ffmpeg.av_hwframe_transfer_data(swFrame, hwFrame, 0);
-            if (err < 0)
-            {
-                ffmpeg.av_frame_free(&swFrame);
-                var errbuf = stackalloc byte[1024];
-                ffmpeg.av_strerror(err, errbuf, 1024);
-                throw new InvalidOperationException($"GPUフレームのCPU転送に失敗しました。原因: {Marshal.PtrToStringAnsi((nint)errbuf)}");
-            }
-
-            // 解像度とフォーマットの明示的な設定
-            swFrame->width = hwFrame->width;
-            swFrame->height = hwFrame->height;
-            swFrame->format = (int)AVPixelFormat.AV_PIX_FMT_NV12; // 多くのハードウェア出力はNV12フォーマット
-
-            return swFrame;
-        }
-
-
         /// <summary>
         /// ファイルを開き、デコーダを初期化します。
         /// </summary>
