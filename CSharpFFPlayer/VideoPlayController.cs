@@ -714,31 +714,6 @@ namespace CSharpFFPlayer
 
 
 
-
-        /// <summary>
-        /// PTS から生フレームインデックスを取得（null なら未定義）
-        /// </summary>
-        public unsafe long? GetRawFrameIndex(ManagedFrame frame)
-        {
-            if (frame == null || frame.Frame == null)
-                return null;
-
-            long pts = frame.Frame->pts;
-            if (pts == ffmpeg.AV_NOPTS_VALUE)
-                return null;
-
-            AVRational timeBase = decoder.VideoStream.time_base;
-            AVRational frameRate = rawFps;
-
-            long frameIndex = ffmpeg.av_rescale_q(
-                pts,
-                timeBase,
-                new AVRational { num = frameRate.den, den = frameRate.num }
-            );
-
-            return frameIndex;
-        }
-
         /// <summary>
         /// CPUフレームバッファが一定量溜まるまで待機
         /// </summary>
