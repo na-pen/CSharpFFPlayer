@@ -20,7 +20,13 @@
 
   <ItemGroup>
     <Reference Include="FFmpeg.AutoGen">
-      <HintPath>..\..\FFmpeg.AutoGen\FFmpeg.AutoGen.dll</HintPath>
+      <HintPath>FFmpeg.AutoGen.dll</HintPath>
+    </Reference>
+    <Reference Include="FFmpeg.AutoGen.Abstractions">
+      <HintPath>FFmpeg.AutoGen.Abstractions.dll</HintPath>
+    </Reference>
+    <Reference Include="FFmpeg.AutoGen.Bindings.DynamicallyLinked">
+      <HintPath>FFmpeg.AutoGen.Bindings.DynamicallyLinked.dll</HintPath>
     </Reference>
   </ItemGroup>
 

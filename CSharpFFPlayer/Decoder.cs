@@ -33,8 +33,53 @@ namespace CSharpFFPlayer
     {
         public Decoder()
         {
-            ffmpeg.RootPath = @"ffmpeg";  // 必要に応じて環境変数からの読み取りに置換可
-                                          // ffmpeg.av_register_all(); // FFmpeg 4.0以降は不要
+            string exeDir = AppContext.BaseDirectory;
+            string ffmpegDir = Path.Combine(exeDir, "ffmpeg");
+            if (!Directory.Exists(ffmpegDir))
+                throw new DirectoryNotFoundException($"FFmpeg ディレクトリが見つかりません: {ffmpegDir}");
+
+            ffmpeg.RootPath = ffmpegDir;
+            Console.WriteLine($"[FFmpeg] RootPath set: {ffmpeg.RootPath}");
+
+
+            // ★ FFmpeg.AutoGen が使うライブラリ名とバージョンのマップを確認
+            foreach (var kv in ffmpeg.LibraryVersionMap)
+            {
+                string dllName = $"{kv.Key}-{kv.Value}.dll";
+                string fullPath = Path.Combine(ffmpeg.RootPath, dllName);
+
+                if (!File.Exists(fullPath))
+                {
+                    Console.WriteLine($"[Error] {dllName} が見つかりません: {fullPath}");
+                    continue;
+                }
+
+                try
+                {
+                    IntPtr handle = NativeLibrary.Load(fullPath);
+                    Console.WriteLine($"[LoadCheck] {dllName} => 成功 (0x{handle.ToInt64():X})");
+
+                    // 特別に avformat-XX.dll なら version 関数を直接呼んでテスト
+                    if (kv.Key.Equals("avformat", StringComparison.OrdinalIgnoreCase))
+                    {
+                        IntPtr proc = NativeLibrary.GetExport(handle, "avformat_version");
+                        if (proc != IntPtr.Zero)
+                        {
+                            delegate* unmanaged[Cdecl]<uint> p = (delegate* unmanaged[Cdecl]<uint>)proc;
+                            uint version = p();
+                            Console.WriteLine($"[Check] avformat_version => {version}");
+                        }
+                        else
+                        {
+                            Console.WriteLine("[Warn] avformat_version がエクスポートされていません。");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[Error] {dllName} のロードに失敗: {ex.Message}");
+                }
+            }
         }
 
         private AVFormatContext* formatContext;
@@ -224,6 +269,16 @@ namespace CSharpFFPlayer
                 AVDictionary* formatOptions = null;
                 VideoInfo videoInfo = new();
 
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    Console.WriteLine($"Loaded Assembly: {asm.FullName}");
+                }
+
+                Console.WriteLine($"FFmpeg RootPath: {ffmpeg.RootPath}");
+                Console.WriteLine($"FFmpeg avformat version: {ffmpeg.avformat_version()}");
+                Console.WriteLine($"FFmpeg version info: {ffmpeg.av_version_info()}");
+
+
                 try
                 {
                     // ストリーム解析のヒントとなるオプションを設定
@@ -231,9 +286,14 @@ namespace CSharpFFPlayer
                     ffmpeg.av_dict_set(&formatOptions, "analyzeduration", "1000000", 0);      // 解析最大時間（ミリセカンド）
 
                     // 入力ファイルを開く
-                    int ret = ffmpeg.avformat_open_input(&_formatContext, path, null, &formatOptions);
+                    int ret = ffmpeg.avformat_open_input(&_formatContext, path, null, null);
                     if (ret < 0)
+                    {
+                        var errbuf = stackalloc byte[1024];
+                        ffmpeg.av_strerror(ret, errbuf, 1024);
+                        Console.WriteLine($"avformat_open_input failed: {Marshal.PtrToStringAnsi((nint)errbuf)}");
                         throw new InvalidOperationException("指定されたファイルを開くことができません。");
+                    }
 
                     formatContext = _formatContext;
 
