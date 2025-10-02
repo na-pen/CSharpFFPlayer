@@ -1,119 +1,129 @@
 ﻿using FFmpeg.AutoGen;
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace CSharpFFPlayer
 {
-    /// <summary>
-    /// フレームを変換する機能を提供する。
-    /// </summary>
+    /// <summary>フレームを変換する（HW→SW済みのCPUフレーム専用）</summary>
     public unsafe class FrameConveter : IDisposable
     {
         private AVPixelFormat srcFormat;
         private int srcWidth;
         private int srcHeight;
-        private AVPixelFormat distFormat;
-        private int distWidth;
-        private int distHeight;
 
-        private int dstStride;              // ★ 追加: 出力ストライド（WPFのBackBufferStride）
+        private AVPixelFormat dstFormat;
+        private int dstWidth;
+        private int dstHeight;
+
+        private int dstStride;                 // WriteableBitmap.BackBufferStride
         private SwsContext* swsContext;
 
-        public void SetDestinationStride(int stride) => dstStride = stride; // ★ 追加
-
-        public unsafe void Configure(int srcWidth, int srcHeight, AVPixelFormat srcFormat,
-                                     int dstWidth, int dstHeight, AVPixelFormat dstFormat)
+        public void SetDestinationStride(int stride)
         {
-            if (srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0)
+            if (stride <= 0) throw new ArgumentOutOfRangeException(nameof(stride));
+            dstStride = stride;
+        }
+
+        public void Configure(int srcW, int srcH, AVPixelFormat srcFmt,
+                              int dstW, int dstH, AVPixelFormat dstFmt)
+        {
+            if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0)
                 throw new InvalidOperationException("Configure に無効なサイズが渡されました。");
+            if (srcFmt == AVPixelFormat.AV_PIX_FMT_NONE || dstFmt == AVPixelFormat.AV_PIX_FMT_NONE)
+                throw new InvalidOperationException("無効なピクセルフォーマットです。");
+            if (IsHwFormat(srcFmt))
+                throw new InvalidOperationException("GPUフォーマットは直接 sws に渡せません（先に CPU へ転送してください）。");
 
-            if (srcFormat == AVPixelFormat.AV_PIX_FMT_NONE || dstFormat == AVPixelFormat.AV_PIX_FMT_NONE)
-                throw new InvalidOperationException("無効なピクセルフォーマットが渡されました。");
+            srcWidth = srcW;
+            srcHeight = srcH;
+            srcFormat = srcFmt;
 
-            if (IsHwFormat(srcFormat))
-                throw new InvalidOperationException("GPUフォーマットは直接 sws_getContext に使用できません。");
-
-            this.srcWidth = srcWidth;
-            this.srcHeight = srcHeight;
-            this.srcFormat = srcFormat;
-            this.distWidth = dstWidth;
-            this.distHeight = dstHeight;
-            this.distFormat = dstFormat;
+            dstWidth = dstW;
+            dstHeight = dstH;
+            dstFormat = dstFmt;
 
             RecreateSws();
         }
 
         private static bool IsHwFormat(AVPixelFormat f) =>
-            f == AVPixelFormat.AV_PIX_FMT_D3D11
-            || f == AVPixelFormat.AV_PIX_FMT_QSV
-            || f == AVPixelFormat.AV_PIX_FMT_CUDA
-            || f == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD
-            || f == AVPixelFormat.AV_PIX_FMT_VAAPI;
+            f == AVPixelFormat.AV_PIX_FMT_D3D11 ||
+            f == AVPixelFormat.AV_PIX_FMT_QSV ||
+            f == AVPixelFormat.AV_PIX_FMT_CUDA ||
+            f == AVPixelFormat.AV_PIX_FMT_DXVA2_VLD ||
+            f == AVPixelFormat.AV_PIX_FMT_VAAPI;
 
         private void RecreateSws()
         {
-            ffmpeg.sws_freeContext(swsContext);
-            const int SWS_BICUBIC = 4;
-            swsContext = ffmpeg.sws_getContext(
+            // sws_getCachedContext を使うと安全（古い ctx を内部で再利用/解放）
+            swsContext = ffmpeg.sws_getCachedContext(
+                swsContext,
                 srcWidth, srcHeight, srcFormat,
-                distWidth, distHeight, distFormat,
-                SWS_BICUBIC,
-                null, null, null);
+                dstWidth, dstHeight, dstFormat,
+                (int)SwsFlags.SWS_BICUBIC, null, null, null);
 
             if (swsContext == null)
-                throw new InvalidOperationException("sws_getContext に失敗しました。");
+                throw new InvalidOperationException("sws_getCachedContext に失敗しました。");
         }
 
-        // 変換元が変わったら即リコンフィグ
+        /// <summary>入力フレームの src 条件が変わったら sws を再設定</summary>
         private void EnsureSource(AVFrame* frame)
         {
             var fmt = (AVPixelFormat)frame->format;
+
+            // HWフレームは受け付けない（必ず CPU へ転送済みにしてから呼ぶ）
+            var desc = ffmpeg.av_pix_fmt_desc_get(fmt);
+            if ((desc->flags & ffmpeg.AV_PIX_FMT_FLAG_HWACCEL) != 0)
+                throw new InvalidOperationException("HWフレームは ConvertFrameDirect に渡せません。");
+
             if (fmt == srcFormat && frame->width == srcWidth && frame->height == srcHeight)
                 return;
-
-            if (IsHwFormat(fmt))
-                throw new InvalidOperationException("GPUフォーマットは ConvertFrameDirect に渡せません。");
 
             srcFormat = fmt;
             srcWidth = frame->width;
             srcHeight = frame->height;
+
             RecreateSws();
         }
 
-        public unsafe void ConvertFrameDirect(ManagedFrame frame, byte* buffer) =>
+        public void ConvertFrameDirect(ManagedFrame frame, byte* buffer) =>
             ConvertFrameDirect(frame.Frame, buffer);
 
-        public unsafe void ConvertFrameDirect(AVFrame* frame, byte* buffer)
+        public void ConvertFrameDirect(AVFrame* frame, byte* buffer)
         {
+            if (frame == null) throw new ArgumentNullException(nameof(frame));
             if (swsContext == null)
-                throw new InvalidOperationException("SwsContext が初期化されていません。Configure() を先に呼び出してください。");
+                throw new InvalidOperationException("Configure 後に呼び出してください。");
+            if (dstStride <= 0)
+                throw new InvalidOperationException("SetDestinationStride(writeableBitmap.BackBufferStride) を先に呼び出してください。");
 
-            // ★ 実フレームに合わせて動的に再設定（GPU→CPU後のNV12/P010/YUV420Pなどに追従）
+            // 入力に合わせて sws を再設定（解像度/フォーマット変化へ追従）
             EnsureSource(frame);
 
+            if (frame->data[0] == null)
+            {
+                Console.WriteLine("[Warn] frame->data[0] が null のためスキップ");
+                return;
+            }
+
+            // 出力平面（BGR24 など packed は plane 0 のみ）
             byte_ptrArray4 dstData = default;
             int_array4 dstLinesize = default;
-
-            // ★ av_image_fill_arrays を使わない（WPFは行パディングあり）
             dstData[0] = buffer;
-            dstLinesize[0] = dstStride > 0 ? dstStride : distWidth * (ffmpeg.av_get_bits_per_pixel(ffmpeg.av_pix_fmt_desc_get(distFormat)) / 8);
-            dstData[1] = null; dstData[2] = null; dstData[3] = null;
-            dstLinesize[1] = 0; dstLinesize[2] = 0; dstLinesize[3] = 0;
+            dstLinesize[0] = dstStride;
+
+            // 実フレームの高さを使う（srcHeight でも同値になるが、こちらが安全）
+            int inHeight = frame->height;
 
             int scaled = ffmpeg.sws_scale(
                 swsContext,
                 frame->data,
                 frame->linesize,
                 0,
-                srcHeight,
+                inHeight,
                 dstData,
                 dstLinesize);
 
             if (scaled <= 0)
-                Console.WriteLine("[警告] sws_scale が 0 を返しました（スキップ）");
+                Console.WriteLine("[Warn] sws_scale が失敗しました（scaled={0})", scaled);
         }
 
         public void Dispose()
@@ -122,5 +132,4 @@ namespace CSharpFFPlayer
             swsContext = null;
         }
     }
-
 }

@@ -1,5 +1,6 @@
 ﻿using FFmpeg.AutoGen;
 using NAudio.Wave;
+using SharpDX.Direct3D11;
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -10,10 +11,12 @@ using System.Runtime.Intrinsics.X86;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Windows.Controls;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using System.Xml.Linq;
+using System.Windows;
 
 namespace CSharpFFPlayer
 {
@@ -31,6 +34,16 @@ namespace CSharpFFPlayer
 
     public class VideoPlayController
     {
+        private readonly Image videoImage; // MainWindow から渡される UI
+        private readonly D3DImage d3dImage;
+        private D3DInteropRenderer d3dRenderer;
+        private WriteableBitmap writeableBitmap;
+
+        public VideoPlayController(Image videoImage, D3DImage d3dImage)
+        {
+            this.videoImage = videoImage ?? throw new ArgumentNullException(nameof(videoImage));
+            this.d3dImage = d3dImage ?? throw new ArgumentNullException(nameof(d3dImage));
+        }
 
         // FFmpeg で使用するピクセル形式（BGR24）
         private static readonly AVPixelFormat ffPixelFormat = AVPixelFormat.AV_PIX_FMT_BGR24;
@@ -79,6 +92,9 @@ namespace CSharpFFPlayer
         // 自動再開を許可するか（Play で true、Pause/Seek 後は false）
         private volatile bool allowAutoResume = false;
 
+        // ループの外で保持（クラスフィールドでもOK）
+        private long prevFrameIdx = -1;
+
 
         /// <summary>
         /// ファイルを開いて FFmpeg デコーダーを初期化
@@ -109,6 +125,23 @@ namespace CSharpFFPlayer
             videoInfo.VideoStreams.FirstOrDefault().Fps = fps;
             baseFrameDurationMs = 1000.0f / fps;
             decoder.InitializeDecoders();
+
+
+            // DirectX のブリッジを初期化
+            Application.Current.Dispatcher.Invoke(() =>
+            {
+                unsafe
+                {
+                    d3dRenderer = new D3DInteropRenderer(
+                        d3dImage,
+                        decoder.VideoCodecContextPointer->width,
+                        decoder.VideoCodecContextPointer->height
+                    );
+                }
+            });
+
+
+
             playbackState = PlaybackState.Stopped;
         }
 
@@ -325,6 +358,7 @@ namespace CSharpFFPlayer
                 playbackState = PlaybackState.Paused;
                 audioPlayer?.Pause();
 
+                prevFrameIdx = -1;
                 Console.WriteLine($"[シーク完了] frameIndex={frameIndex}, cpuFrames={cpuFrames.Count}, 状態={playbackState}");
                 return true;
             }
@@ -441,7 +475,6 @@ namespace CSharpFFPlayer
             const int RESUME_GRACE_MS = 250;
             var resumeGrace = new Stopwatch();
             var lastState = playbackState;
-
             while (playbackState != PlaybackState.Stopped && playbackState != PlaybackState.Ended)
             {
                 // ---- バッファ監視（ヒステリシス + グレース期間）----
@@ -531,46 +564,83 @@ namespace CSharpFFPlayer
 
                 // ---- フレーム取得 → 最新フレームとして提示（描画は Rendering で）----
                 // 再生ループ内
+                // ---- フレーム取得 ----
                 var frame = DequeueCpuFrame();
                 if (frame != null)
                 {
+                    bool enqueued = false; // ← ここで所有権管理
                     try
                     {
-                        if (frame.IsGpuFrame)
+                        // --- GPU描画ルート---
+                        if (frame.IsGpuFrame && d3dRenderer != null)
                         {
-                            unsafe { frame.GetCpuFrame(); } // ★ここでCPU転送を強制
-                        }
-
-                        unsafe
-                        {
-                            if (frame.Frame == null) // まだ転送に失敗した場合
+                            unsafe
                             {
-                                frame.Dispose();
-                                continue;
+                                AVFrame* hwFrame = frame.Frame;
+                                if (hwFrame != null)
+                                {
+                                    IntPtr texPtr = (IntPtr)hwFrame->data[0];
+                                    using (var tex11 = new Texture2D(texPtr))
+                                    {
+                                        d3dRenderer.UpdateFrame(tex11);
+                                    }
+                                    Console.WriteLine("[Draw] GPU→D3D11 直描画");
+                                    // frame は UI に渡していないのでここで Dispose してよい
+                                }
+                                else
+                                {
+                                    Console.WriteLine("[Warn] GPUフレームが null → CPU にフォールバック");
+                                    frame.GetCpuFrame();
+                                    if (frame.Frame != null)
+                                    {
+                                        imageWriter.EnqueueFrame(frame);
+                                        enqueued = true; // ← 所有権を ImageWriter に移譲
+                                        Console.WriteLine("[Draw] CPUフォールバック (WriteableBitmap)");
+                                    }
+                                }
                             }
                         }
-
-                        long frameIdx = frame.Index < 0 ? frameIndex + 1 : frame.Index;
-                        long prevFrameIdx = -1;
-
-                        if (frameIdx >= 0)
+                        else
                         {
+                            // --- CPU描画ルート ---
+                            if (frame.IsGpuFrame)
+                            {
+                                unsafe { frame.GetCpuFrame(); } // GPU→CPU 転送
+                            }
+
+                            unsafe
+                            {
+                                if (frame.Frame == null)
+                                {
+                                    // 転送に失敗したら破棄して次へ
+                                    Console.WriteLine("[Skip] CPU転送失敗フレーム");
+                                    continue;
+                                }
+                            }
+
+                            long frameIdx = frame.Index < 0 ? frameIndex + 1 : frame.Index;
                             if (prevFrameIdx >= 0 && frameIdx <= prevFrameIdx)
                             {
-                                frame.Dispose();
-                                continue; // ★古いフレームはスキップ
+                                Console.WriteLine($"[Skip] 古いフレーム idx={frameIdx} <= prev={prevFrameIdx}");
+                                continue;
                             }
+
+                            imageWriter.EnqueueFrame(frame);
+                            enqueued = true;            // ← 所有権移譲！
                             prevFrameIdx = frameIdx;
+                            frameIndex = (int)frameIdx;
+                            Console.WriteLine("[Draw] CPU (WriteableBitmap) idx=" + frameIdx);
                         }
-
-                        imageWriter.EnqueueFrame(frame);
-                        frameIndex = (int)frameIdx;
-
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[描画前CPU転送失敗] {ex.Message}");
-                        frame.Dispose();
+                        Console.WriteLine($"[描画処理失敗] {ex.Message}");
+                    }
+                    finally
+                    {
+                        // エンキューした場合は ImageWriter 側で Dispose されるので、ここでは Dispose しない
+                        if (!enqueued)
+                            frame.Dispose();
                     }
                 }
 
@@ -594,6 +664,50 @@ namespace CSharpFFPlayer
 
 
 
+        /*
+         var frame = DequeueCpuFrame();
+if (frame != null)
+{
+    try
+    {
+        if (frame.IsGpuFrame)
+        {
+            unsafe { frame.GetCpuFrame(); } // ★ここでCPU転送を強制
+        }
+
+        unsafe
+        {
+            if (frame.Frame == null) // まだ転送に失敗した場合
+            {
+                frame.Dispose();
+                continue;
+            }
+        }
+
+        long frameIdx = frame.Index < 0 ? frameIndex + 1 : frame.Index;
+        long prevFrameIdx = -1;
+
+        if (frameIdx >= 0)
+        {
+            if (prevFrameIdx >= 0 && frameIdx <= prevFrameIdx)
+            {
+                frame.Dispose();
+                continue; // ★古いフレームはスキップ
+            }
+            prevFrameIdx = frameIdx;
+        }
+
+        imageWriter.EnqueueFrame(frame);
+        frameIndex = (int)frameIdx;
+
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[描画前CPU転送失敗] {ex.Message}");
+        frame.Dispose();
+    }
+}
+         */
 
 
 
@@ -712,6 +826,24 @@ namespace CSharpFFPlayer
             // frameIndexFactor = 1;
         }
 
+        public void RenderGpuFrame(Texture2D tex11)
+        {
+            d3dRenderer?.UpdateFrame(tex11);
+        }
+
+        public void RenderCpuFrame(ManagedFrame frame)
+        {
+            if (writeableBitmap == null) return;
+
+            writeableBitmap.Lock();
+            unsafe
+            {
+                byte* bufferPtr = (byte*)writeableBitmap.BackBuffer.ToPointer();
+                // FrameConverter で RGB コピー
+            }
+            writeableBitmap.AddDirtyRect(new System.Windows.Int32Rect(0, 0, writeableBitmap.PixelWidth, writeableBitmap.PixelHeight));
+            writeableBitmap.Unlock();
+        }
 
 
         /// <summary>

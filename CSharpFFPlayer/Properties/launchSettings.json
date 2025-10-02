@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "CSharpFFPlayer": {
+      "commandName": "Project",
+      "nativeDebugging": true
+    }
+  }
+}

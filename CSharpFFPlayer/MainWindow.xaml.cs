@@ -1,16 +1,17 @@
 ﻿using CSharpFFPlayer;
 using Microsoft.WindowsAPICodePack.Dialogs;
+using System.ComponentModel;
+using System.IO;
+using System.Linq;
 using System.Text;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
-using System.ComponentModel;
 
 namespace CSharpFFPlayer
 {
@@ -18,6 +19,8 @@ namespace CSharpFFPlayer
     {
         private VideoPlayController? _videoPlayController = null;
         private WriteableBitmap _writeableBitmap;
+        private VideoPlayController controller = null;
+        private D3DImage d3dImage;
 
         private bool isDraggingSlider = false;
         private bool isUpdatingSlider = false;
@@ -60,6 +63,9 @@ namespace CSharpFFPlayer
         public MainWindow()
         {
             InitializeComponent();
+            d3dImage = new D3DImage();
+            VideoImage.Source = d3dImage;
+            controller = new VideoPlayController(VideoImage, d3dImage);
         }
 
         private void ShowLoading(bool isVisible)
@@ -83,7 +89,6 @@ namespace CSharpFFPlayer
 
                 _videoPlayController = await Task.Run(() =>
                 {
-                    var controller = new VideoPlayController();
                     controller.OpenFile(filePath);
                     return controller;
                 });

@@ -57,31 +57,47 @@ namespace CSharpFFPlayer
             {
                 if (latest.IsGpuFrame)
                 {
-                    unsafe { latest.GetCpuFrame(); }
-                    unsafe { if (latest.Frame == null) return; }
+                    unsafe
+                    {
+                        latest.GetCpuFrame();
+                        if (latest.Frame == null)
+                        {
+                            // GPU→CPU 転送失敗なら破棄して return
+                            return;
+                        }
+                    }
                 }
 
                 writeableBitmap.Lock();
-                unsafe
+                try
                 {
-                    byte* bufferPtr = (byte*)writeableBitmap.BackBuffer.ToPointer();
-                    frameConveter.ConvertFrameDirect(latest, bufferPtr);
-                    writeableBitmap.AddDirtyRect(rect);
+                    unsafe
+                    {
+                        byte* bufferPtr = (byte*)writeableBitmap.BackBuffer.ToPointer();
+                        frameConveter.ConvertFrameDirect(latest, bufferPtr);
+                        writeableBitmap.AddDirtyRect(rect);
+                    }
+                }
+                finally
+                {
+                    writeableBitmap.Unlock();
                 }
             }
             finally
             {
-                writeableBitmap.Unlock();
                 latest.Dispose();
 
-                // もし描画中に次のフレームが届いていたらもう一度呼ぶ
+                // 次が残っていれば再度描画を要求
                 if (!renderQueue.IsEmpty)
+                {
                     Application.Current.Dispatcher.BeginInvoke(
                         new Action(RenderLatestFrame),
                         System.Windows.Threading.DispatcherPriority.Render
                     );
+                }
             }
         }
+
 
         public void ClearQueue()
         {
