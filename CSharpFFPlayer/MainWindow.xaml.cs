@@ -17,7 +17,7 @@ namespace CSharpFFPlayer
     public partial class MainWindow : MahApps.Metro.Controls.MetroWindow, INotifyPropertyChanged
     {
         private VideoPlayController? _videoPlayController = null;
-        private WriteableBitmap _writeableBitmap;
+        private ImageSource _imageSource;
 
         private bool isDraggingSlider = false;
         private bool isUpdatingSlider = false;
@@ -134,10 +134,10 @@ namespace CSharpFFPlayer
             int dpiY = (int)Math.Round(96 / matrix.M22);
 
             // ★ CreateBitmapAsync は async メソッドなので必ず await する
-            _writeableBitmap = await _videoPlayController.CreateBitmapAsync(dpiX, dpiY);
+            _imageSource = await _videoPlayController.CreateBitmapAsync(dpiX, dpiY,RenderTargetType.D3DImage);
 
             // ★ await 完了後に UI にセット
-            VideoImage.Source = _writeableBitmap;
+            VideoImage.Source = _imageSource;
 
             // ★ 総再生時間を正しく表示
             TimeSpan total = _videoPlayController.VideoInfo.Duration.ToTimeSpan();

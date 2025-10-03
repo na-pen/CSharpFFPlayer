@@ -115,6 +115,20 @@ namespace CSharpFFPlayer
             if (scaled <= 0)
                 Console.WriteLine("[警告] sws_scale が 0 を返しました（スキップ）");
         }
+        public unsafe byte[] ConvertFrameToArray(ManagedFrame frame)
+        {
+            int bpp = ffmpeg.av_get_bits_per_pixel(ffmpeg.av_pix_fmt_desc_get(distFormat)) / 8;
+            int stride = distWidth * bpp;
+            int bufferSize = stride * distHeight;
+            byte[] buffer = new byte[bufferSize];
+
+            fixed (byte* dst = buffer)
+            {
+                ConvertFrameDirect(frame.Frame, dst);
+            }
+
+            return buffer;
+        }
 
         public void Dispose()
         {

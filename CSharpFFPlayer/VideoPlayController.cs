@@ -10,6 +10,7 @@ using System.Runtime.Intrinsics.X86;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using System.Windows.Controls;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
@@ -49,7 +50,9 @@ namespace CSharpFFPlayer
         private readonly object audioLock = new object();
 
         private Decoder decoder;
-        private ImageWriter imageWriter;
+        //private ImageWriter imageWriter;
+        private UnifiedImageWriter imageWriter;
+
         private FrameConveter frameConveter;
 
         private const int frameCap = 50;
@@ -116,7 +119,7 @@ namespace CSharpFFPlayer
         /// <summary>
         /// 最初のフレームを取得し、WPF 描画用の WriteableBitmap を作成する
         /// </summary>
-        public async Task<WriteableBitmap> CreateBitmapAsync(int dpiX, int dpiY)
+        public async Task<ImageSource> CreateBitmapAsync(int dpiX, int dpiY, RenderTargetType targetType)
         {
             if (decoder is null)
                 throw new InvalidOperationException("動画を開いてから描画先を作成してください。");
@@ -140,19 +143,21 @@ namespace CSharpFFPlayer
                 unsafe
                 {
                     if (result == FrameReadResult.FrameAvailable && managedFrame.Frame != null)
-
                         break;
                 }
+
                 // フレームが無効なら破棄して次へ
                 managedFrame?.Dispose();
                 managedFrame = null;
                 await Task.Delay(10);
             }
+
             unsafe
             {
                 if (result != FrameReadResult.FrameAvailable || managedFrame == null || managedFrame.Frame == null)
                     throw new InvalidOperationException("最初のフレームの取得に失敗しました。");
             }
+
             // GPU → CPU 転送
             if (managedFrame.IsGpuFrame)
                 unsafe { managedFrame.GetCpuFrame(); }
@@ -167,11 +172,27 @@ namespace CSharpFFPlayer
                 int height = frame->height;
                 AVPixelFormat srcFormat = (AVPixelFormat)frame->format;
 
-                var writeableBitmap = new WriteableBitmap(width, height, dpiX, dpiY, wpfPixelFormat, null);
                 frameConveter = new FrameConveter();
-                frameConveter.Configure(width, height, srcFormat, width, height, ffPixelFormat);
 
-                imageWriter = new ImageWriter(width, height, writeableBitmap, frameConveter);
+                ImageSource output;
+
+                if (targetType == RenderTargetType.WriteableBitmap)
+                {
+                    frameConveter.Configure(width, height, srcFormat, width, height, ffPixelFormat);
+                    // WriteableBitmap を作成
+                    var wb = new WriteableBitmap(width, height, dpiX, dpiY, wpfPixelFormat, null);
+                    imageWriter = new UnifiedImageWriter(RenderTargetType.WriteableBitmap, width, height, frameConveter, wb);
+
+                    output = wb;
+                }
+                else // RenderTargetType.D3DImage
+                {
+                    frameConveter.Configure(width, height, srcFormat, width, height, AVPixelFormat.AV_PIX_FMT_BGRA);
+                    var di = new D3DImage();
+                    imageWriter = new UnifiedImageWriter(RenderTargetType.D3DImage, width, height, frameConveter, di : di);
+
+                    output = di;
+                }
 
                 // 安全にインデックス設定
                 managedFrame.Index = GetFrameIndex(managedFrame) ?? -1;
@@ -179,13 +200,13 @@ namespace CSharpFFPlayer
                 // 最新フレームとしてキャッシュ（初回描画はRenderingイベントで行われる）
                 imageWriter.EnqueueFrame(managedFrame);
 
-
                 // 再生開始時に同期が取りやすいようキューにも積む
                 cpuFrames.Enqueue(managedFrame);
 
-                return writeableBitmap;
+                return output;
             }
         }
+
 
 
 
