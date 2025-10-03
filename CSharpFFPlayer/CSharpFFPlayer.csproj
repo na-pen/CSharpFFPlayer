@@ -12,6 +12,7 @@
 
   <ItemGroup>
     <PackageReference Include="MahApps.Metro" Version="2.4.10" />
+    <PackageReference Include="ManagedCuda-12" Version="12.8.60" />
     <PackageReference Include="MaterialDesignThemes" Version="5.2.1" />
     <PackageReference Include="NAudio" Version="2.2.1" />
     <PackageReference Include="SharpDX" Version="4.2.0" />

@@ -609,34 +609,30 @@ namespace CSharpFFPlayer
                 {
                     try
                     {
-                        if (frame.IsGpuFrame && targetType == RenderTargetType.WriteableBitmap)
-                        {
-                            unsafe { frame.GetCpuFrame(); } // ★ここでCPU転送を強制
-                        }
-
-                        unsafe
-                        {
-                            if (frame.Frame == null) // まだ転送に失敗した場合
-                            {
-                                frame.Dispose();
-                                continue;
-                            }
-                        }
-
-                        long frameIdx = frame.Index < 0 ? frameIndex + 1 : frame.Index;
                         long prevFrameIdx = -1;
 
-                        if (frameIdx >= 0)
-                        {
-                            if (prevFrameIdx >= 0 && frameIdx <= prevFrameIdx)
-                            {
-                                frame.Dispose();
-                                continue; // ★古いフレームはスキップ
-                            }
-                            prevFrameIdx = frameIdx;
-                        }
+                        // 古いフレームスキップ用の prevFrameIdx はループ外(フィールド)で保持してね
+                        long frameIdx = frame.Index < 0 ? frameIndex + 1 : frame.Index;
+                        if (prevFrameIdx >= 0 && frameIdx <= prevFrameIdx) { frame.Dispose(); continue; }
+                        prevFrameIdx = frameIdx;
 
-                        imageWriter.EnqueueFrame(frame);
+                        if (targetType == RenderTargetType.WriteableBitmap)
+                        {
+                            if (frame.IsGpuFrame)
+                            {
+                                unsafe { frame.GetCpuFrame(); } // CPUへダウンロード
+                                unsafe { if (frame.Frame == null) { frame.Dispose(); continue; } }
+                            }
+
+                            // 既存パス
+                            imageWriter.EnqueueFrame(frame);
+                        }
+                        else // D3DImage
+                        {
+                            // ★ GPU/CPUどちらでもOKな統一APIを使う
+                            byte[] bgra = decoder.GetBgraFrame(frame, frameConveter, bt709: true);
+                            imageWriter.PresentBgra(bgra);
+                        }
                         frameIndex = (int)frameIdx;
 
                     }

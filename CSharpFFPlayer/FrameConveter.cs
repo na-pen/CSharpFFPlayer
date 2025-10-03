@@ -117,17 +117,46 @@ namespace CSharpFFPlayer
         }
         public unsafe byte[] ConvertFrameToArray(ManagedFrame frame)
         {
-            int bpp = ffmpeg.av_get_bits_per_pixel(ffmpeg.av_pix_fmt_desc_get(distFormat)) / 8;
-            int stride = distWidth * bpp;
-            int bufferSize = stride * distHeight;
-            byte[] buffer = new byte[bufferSize];
-
-            fixed (byte* dst = buffer)
+            switch (frame.HwDeviceType)
             {
-                ConvertFrameDirect(frame.Frame, dst);
-            }
+                case AVHWDeviceType.AV_HWDEVICE_TYPE_NONE:
+                    {
+                        int bpp = ffmpeg.av_get_bits_per_pixel(ffmpeg.av_pix_fmt_desc_get(distFormat)) / 8;
+                        int stride = distWidth * bpp;
+                        int bufferSize = stride * distHeight;
+                        byte[] buffer = new byte[bufferSize];
 
-            return buffer;
+                        fixed (byte* dst = buffer)
+                        {
+                            ConvertFrameDirect(frame.Frame, dst);
+                        }
+
+                        return buffer;
+                    }
+                case AVHWDeviceType.AV_HWDEVICE_TYPE_CUDA:
+                    {
+                        // ==== CUDAフレーム ====
+
+                        frame.GetCpuFrame();
+
+                        int bpp = ffmpeg.av_get_bits_per_pixel(ffmpeg.av_pix_fmt_desc_get(distFormat)) / 8;
+                        int stride = distWidth * bpp;
+                        int bufferSize = stride * distHeight;
+                        byte[] buffer = new byte[bufferSize];
+
+                        fixed (byte* dst = buffer)
+                        {
+                            ConvertFrameDirect(frame.Frame, dst);
+                        }
+
+                        return buffer;
+
+                        // 案2: GPU→D3D経路に直結させたい場合はここに BlitCUDAFrameToD3D() を呼ぶ
+                        // return Array.Empty<byte>();
+                    }
+                default:
+                    throw new NotSupportedException($"Unsupported hardware type: {frame.HwDeviceType}");
+            }
         }
 
         public void Dispose()

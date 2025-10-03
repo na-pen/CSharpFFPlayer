@@ -1,14 +1,17 @@
-﻿using System;
+﻿using FFmpeg.AutoGen;
+using ManagedCuda;
+using ManagedCuda.BasicTypes;
+using ManagedCuda.VectorTypes;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Controls;
-using System.Management;
-using FFmpeg.AutoGen;
 
 namespace CSharpFFPlayer
 {
@@ -350,6 +353,11 @@ namespace CSharpFFPlayer
             return info;
         }
 
+        private CudaContext _decCudaCtx;
+        private CudaKernel _decNv12ToBgra;
+        private CudaDeviceVariable<byte> _decOutBgra;
+        private bool _decCudaReady;
+
         private AVHWDeviceType? hwType = null;
         /// <summary>
         /// 映像・音声デコーダを初期化し、必要ならハードウェアコンテキストを作成。
@@ -431,7 +439,107 @@ namespace CSharpFFPlayer
                 ffmpeg.av_dict_free(&opts);
             }
         }
+        [StructLayout(LayoutKind.Sequential)]
+        unsafe struct AVCUDADeviceContext { public IntPtr cuda_ctx; }
 
+        // 以前: EnsureCudaOnDecodeThreadInitialized()
+        private unsafe void EnsureCudaOnDecodeThreadInitialized(AVFrame* hwFrame)
+        {
+            if (_decCudaReady) return;
+
+            // 1) このスレッドに current ctx があるか
+            CUcontext cu = new CUcontext();
+            var rc = DriverAPINativeMethods.ContextManagement.cuCtxGetCurrent(ref cu);
+
+            if (rc != CUResult.Success || cu.Pointer == IntPtr.Zero)
+            {
+                // 2) フレームから FFmpeg の CUcontext を取り出して current にする
+                if (hwFrame == null || hwFrame->hw_frames_ctx == null)
+                    throw new InvalidOperationException("CUDA ctx attach 失敗: hw_frames_ctx が無効。");
+
+                var frames = (AVHWFramesContext*)hwFrame->hw_frames_ctx->data;
+                var devRef = frames->device_ref;
+                if (devRef == null) throw new InvalidOperationException("CUDA ctx attach 失敗: device_ref が null。");
+
+                var devCtx = (AVHWDeviceContext*)devRef->data;
+                if (devCtx == null || devCtx->hwctx == null)
+                    throw new InvalidOperationException("CUDA ctx attach 失敗: device_ctx/hwctx が無効。");
+
+                // 最小限の宣言:
+                // struct AVCUDADeviceContext { public IntPtr cuda_ctx; }
+                var cuDev = (AVCUDADeviceContext*)devCtx->hwctx;
+                if (cuDev->cuda_ctx == IntPtr.Zero)
+                    throw new InvalidOperationException("CUDA ctx attach 失敗: cuda_ctx が null。");
+
+                var want = new CUcontext { Pointer = cuDev->cuda_ctx };
+                var rcSet = DriverAPINativeMethods.ContextManagement.cuCtxSetCurrent(want);
+                if (rcSet != CUResult.Success)
+                    throw new InvalidOperationException($"cuCtxSetCurrent 失敗: {rcSet}");
+            }
+
+            // 3) 既存 current ctx にバインド（新規作成しない）
+            _decCudaCtx = new CudaContext(0, CUCtxFlags.SchedAuto, createNew: false);
+            _decCudaCtx.SetCurrent();
+
+            // 4) PTX / カーネル
+            string ptxPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "nv12_to_bgra.ptx");
+            var module = _decCudaCtx.LoadModulePTX(File.ReadAllBytes(ptxPath));
+            _decNv12ToBgra = new CudaKernel("Nv12ToBgraKernel", module, _decCudaCtx);
+
+            _decCudaReady = true;
+        }
+
+
+        private unsafe byte[] ConvertCudaNV12FrameToBgra_OnDecodeThread(AVFrame* hwFrame, bool bt709 = true)
+        {
+            EnsureCudaOnDecodeThreadInitialized(hwFrame);        // ★ このスレッドで current & kernel 準備
+            _decCudaCtx.SetCurrent();                     // 念のため毎回カレント化
+
+            // 尺はフレームから取る（引数の希望サイズは使わない）
+            int w = hwFrame->width;
+            int h = hwFrame->height;
+
+            // SW フォーマット（NV12以外なら CPU フォールバック推奨）
+            var frames = (AVHWFramesContext*)hwFrame->hw_frames_ctx->data;
+            var swfmt = (AVPixelFormat)frames->sw_format;
+            if (swfmt != AVPixelFormat.AV_PIX_FMT_NV12)
+                throw new NotSupportedException($"GPUカーネルはNV12専用です。実際は {swfmt}。");
+
+            // デバイスポインタとピッチ
+            var yDev = new CUdeviceptr((ulong)hwFrame->data[0]);
+            var uvDev = new CUdeviceptr((ulong)hwFrame->data[1]);
+            int pitchY = hwFrame->linesize[0];
+            int pitchUV = hwFrame->linesize[1];
+            if (yDev.Pointer == 0 || pitchY <= 0) throw new InvalidOperationException("Y plane invalid");
+            if (uvDev.Pointer == 0 || pitchUV <= 0) throw new InvalidOperationException("UV plane invalid");
+
+            // 出力確保
+            int pitchOut = w * 4;
+            int bufSize = pitchOut * h;
+            if (_decOutBgra == null || _decOutBgra.Size < bufSize)
+            {
+                _decOutBgra?.Dispose();
+                _decOutBgra = new CudaDeviceVariable<byte>(bufSize);
+            }
+
+            // カーネル起動
+            _decNv12ToBgra.BlockDimensions = new dim3(32, 16);
+            _decNv12ToBgra.GridDimensions = new dim3((w + 31) / 32, (h + 15) / 16);
+            int useBT709 = bt709 ? 1 : 0;
+
+            _decNv12ToBgra.Run(
+                yDev, pitchY,
+                uvDev, pitchUV,
+                _decOutBgra.DevicePointer, pitchOut,
+                w, h, useBT709
+            );
+            _decCudaCtx.Synchronize();
+
+            // GPU→CPU
+            var host = new byte[bufSize];
+            _decOutBgra.CopyToHost(host);
+            return host;
+        }
 
 
         private AVStream* GetFirstVideoStream()
@@ -793,6 +901,28 @@ namespace CSharpFFPlayer
 
 
             isDisposed = true;
+        }
+
+        /// <summary>
+        /// CUDAハードウェアフレーム (NV12) を BGRA 配列に変換して返す。
+        /// CPUフレームは conv にフォールバック。
+        /// </summary>
+        public unsafe byte[] GetBgraFrame(ManagedFrame managed, FrameConveter conv, bool bt709 = true)
+        {
+            if (managed == null || managed.Frame == null)
+                throw new ArgumentNullException(nameof(managed));
+
+            AVFrame* frame = managed.Frame;
+
+            if (videoHardwareType == AVHWDeviceType.AV_HWDEVICE_TYPE_CUDA &&
+                managed.IsGpuFrame &&
+                frame->format == (int)AVPixelFormat.AV_PIX_FMT_CUDA)
+            {
+                return ConvertCudaNV12FrameToBgra_OnDecodeThread(frame, bt709);
+            }
+
+            // ★ 二重解放を避けるため、既存 ManagedFrame をそのまま使う
+            return conv.ConvertFrameToArray(managed);
         }
 
 
