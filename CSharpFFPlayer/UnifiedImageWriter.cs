@@ -141,10 +141,6 @@ namespace CSharpFFPlayer
                     }
                     RenderToWriteableBitmap(latest);
                 }
-                else if (targetType == RenderTargetType.D3DImage)
-                {
-                    RenderToD3DImage(latest);
-                }
             }
             finally
             {
@@ -172,94 +168,156 @@ namespace CSharpFFPlayer
             writeableBitmap.Unlock();
         }
 
-        private void RenderToD3DImage(ManagedFrame frame)
+
+        private bool d3dBackBufferSetOnce = false;
+        // フィールドを追加
+        private readonly object _presentLock = new object();
+        private volatile bool _presentScheduled = false;
+
+        // 「最新」フレームだけ保持（古いのは上書き＝参照解放）
+        private byte[]? _latestBgra;
+        private Action<byte[]>? _onConsumed; // ArrayPool 返却などをしたい場合に使う（任意）
+
+        // 再利用用のシステムメモリテクスチャ（D3DImage用）
+        private Texture? _sysTexReuse;
+        private Surface? _sysSurfReuse;
+
+        private void EnsureSysmemTexture()
         {
-            switch (frame.HwDeviceType)
+            if (_sysTexReuse != null && !_sysTexReuse.IsDisposed) return;
+            _sysSurfReuse?.Dispose();
+            _sysTexReuse?.Dispose();
+            _sysTexReuse = new Texture(device, width, height, 1,
+                                       Usage.Dynamic, Format.A8R8G8B8, Pool.SystemMemory);
+            _sysSurfReuse = _sysTexReuse.GetSurfaceLevel(0);
+        }
+
+        private unsafe void CopyToWriteableBitmap(byte[] src)
+        {
+            writeableBitmap!.Lock();
+            try
             {
-                case AVHWDeviceType.AV_HWDEVICE_TYPE_NONE:
+                int dstStride = writeableBitmap.BackBufferStride;
+                int srcStride = width * 4;
+                int rows = height;
+                IntPtr dst = writeableBitmap.BackBuffer;
+
+                if (dstStride == srcStride)
+                {
+                    Buffer.MemoryCopy(
+                        source: System.Runtime.CompilerServices.Unsafe.AsPointer(ref src[0]),
+                        destination: dst.ToPointer(),
+                        destinationSizeInBytes: dstStride * rows,
+                        sourceBytesToCopy: srcStride * rows);
+                }
+                else
+                {
+                    // 行ごとコピー（パディング対応）
+                    int copy = Math.Min(dstStride, srcStride);
+                    fixed (byte* pSrc0 = src)
                     {
-                        // CPU フレームを BGRA 配列に変換
-                        byte[] bgra = frameConveter.ConvertFrameToArray(frame);
-
-                        // 書き込み用システムメモリテクスチャ
-                        using (var sysTex = new Texture(device, width, height, 1,
-                                                        Usage.Dynamic, Format.A8R8G8B8, Pool.SystemMemory))
+                        byte* pSrc = pSrc0;
+                        byte* pDst = (byte*)dst.ToPointer();
+                        for (int y = 0; y < rows; y++)
                         {
-                            var rect = sysTex.LockRectangle(0, LockFlags.Discard);
-                            Marshal.Copy(bgra, 0, rect.DataPointer, bgra.Length);
-                            sysTex.UnlockRectangle(0);
-
-                            // sysTex → surface にコピー
-                            using (var sysSurf = sysTex.GetSurfaceLevel(0))
-                            {
-                                device!.UpdateSurface(sysSurf, null, d3d9SharedSurf, null);
-                            }
+                            Buffer.MemoryCopy(pSrc, pDst, dstStride, copy);
+                            pSrc += srcStride;
+                            pDst += dstStride;
                         }
-
-                        Application.Current.Dispatcher.BeginInvoke(new Action(() =>
-                        {
-                            d3dImage!.Lock();
-                            d3dImage.AddDirtyRect(new Int32Rect(0, 0, width, height));
-                            d3dImage.Unlock();
-                        }), System.Windows.Threading.DispatcherPriority.Render);
-                        break;
                     }
-                case AVHWDeviceType.AV_HWDEVICE_TYPE_CUDA:
-                    {
-                        break;
-                    }
-
-                default:
-                    {
-                        Console.WriteLine($"[警告] 未対応の HwDeviceType: {frame.HwDeviceType}");
-                        break;
-                    }
+                }
+                writeableBitmap.AddDirtyRect(new Int32Rect(0, 0, width, height));
+            }
+            finally
+            {
+                writeableBitmap.Unlock();
             }
         }
 
-        private bool d3dBackBufferSetOnce = false;
-        public void PresentBgra(byte[] bgra)
+        // 合流描画用
+        private bool _presentPending = false;
+        private byte[]? _pendingBgra;
+        private Action<byte[]>? _pendingOnConsumed;
+
+
+        public void PresentBgra(byte[] bgra, Action<byte[]>? onConsumed = null)
         {
-            if (targetType == RenderTargetType.WriteableBitmap)
+            // 最新だけ保持。すでに保留があるなら古い方は返却（破棄）して上書き。
+            lock (_presentLock)
             {
-                Application.Current.Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    writeableBitmap!.Lock();
-                    unsafe
-                    {
-                        Buffer.MemoryCopy(
-                            source: Unsafe.AsPointer(ref bgra[0]),
-                            destination: writeableBitmap.BackBuffer.ToPointer(),
-                            destinationSizeInBytes: writeableBitmap.BackBufferStride * writeableBitmap.PixelHeight,
-                            sourceBytesToCopy: bgra.Length);
-                    }
-                    writeableBitmap.AddDirtyRect(rect);
-                    writeableBitmap.Unlock();
-                }), System.Windows.Threading.DispatcherPriority.Render);
-                return;
+                if (_pendingBgra != null && _pendingBgra != bgra)
+                    _pendingOnConsumed?.Invoke(_pendingBgra);
+
+                _pendingBgra = bgra;
+                _pendingOnConsumed = onConsumed;
+
+                if (_presentPending) return;          // すでにUIに投げ済み
+                _presentPending = true;
             }
 
-            // D3DImage 経路（sysmem テクスチャ → d3d9SharedSurf → D3DImage）
-            Application.Current.Dispatcher.BeginInvoke(new Action(() =>
-            {
-                using (var sysTex = new Texture(device, width, height, 1,
-                                                Usage.Dynamic, Format.A8R8G8B8, Pool.SystemMemory))
-                {
-                    var lr = sysTex.LockRectangle(0, LockFlags.Discard);
-                    Marshal.Copy(bgra, 0, lr.DataPointer, bgra.Length);
-                    sysTex.UnlockRectangle(0);
+            // 一回だけUIスレッドへ。処理後にまだ最新があればもう一回だけ投げ直す。
+            Application.Current.Dispatcher.BeginInvoke((Action)RenderLatestBgra, System.Windows.Threading.DispatcherPriority.Render);
+        }
 
-                    using (var sysSurf = sysTex.GetSurfaceLevel(0))
+        private void RenderLatestBgra()
+        {
+            byte[]? current;
+            Action<byte[]>? cb;
+
+            // 最新を引き当て、スロットを空にする
+            lock (_presentLock)
+            {
+                current = _pendingBgra;
+                cb = _pendingOnConsumed;
+                _pendingBgra = null;
+                _pendingOnConsumed = null;
+            }
+
+            try
+            {
+                if (current == null) return; // 競合で消えた
+
+                if (targetType == RenderTargetType.WriteableBitmap)
+                {
+                    CopyToWriteableBitmap(current);
+                }
+                else // D3DImage
+                {
+                    // 必要ならデバイス復活
+                    if (device == null || device.IsDisposed || d3d9SharedSurf == null || d3d9SharedSurf.IsDisposed)
+                        InitD3D9();
+
+                    EnsureSysmemTexture();
+
+                    var lr = _sysTexReuse!.LockRectangle(0, LockFlags.Discard);
+                    Marshal.Copy(current, 0, lr.DataPointer, current.Length);
+                    _sysTexReuse.UnlockRectangle(0);
+
+                    device!.UpdateSurface(_sysSurfReuse!, null, d3d9SharedSurf, null);
+
+                    d3dImage!.Lock();
+                    d3dImage.AddDirtyRect(new Int32Rect(0, 0, width, height));
+                    d3dImage.Unlock();
+                }
+            }
+            finally
+            {
+                // 配列の返却があればここで
+                cb?.Invoke(current!);
+
+                // 描画中にさらに新しいフレームが到着していたら、もう一回だけスケジュール
+                lock (_presentLock)
+                {
+                    if (_pendingBgra != null)
                     {
-                        // ★ 宛先は d3d9SharedSurf（null の surface ではない）
-                        device!.UpdateSurface(sysSurf, null, d3d9SharedSurf, null);
+                        Application.Current.Dispatcher.BeginInvoke((Action)RenderLatestBgra, System.Windows.Threading.DispatcherPriority.Render);
+                    }
+                    else
+                    {
+                        _presentPending = false; // 何もなければアイドルへ
                     }
                 }
-
-                d3dImage!.Lock();
-                d3dImage.AddDirtyRect(new Int32Rect(0, 0, width, height));
-                d3dImage.Unlock();
-            }), System.Windows.Threading.DispatcherPriority.Render);
+            }
         }
 
 
