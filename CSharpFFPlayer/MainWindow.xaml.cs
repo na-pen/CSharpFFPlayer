@@ -134,7 +134,7 @@ namespace CSharpFFPlayer
             int dpiY = (int)Math.Round(96 / matrix.M22);
 
             // ★ CreateBitmapAsync は async メソッドなので必ず await する
-            _imageSource = await _videoPlayController.CreateBitmapAsync(dpiX, dpiY,RenderTargetType.D3DImage);
+            _imageSource = await _videoPlayController.CreateBitmapAsync(dpiX, dpiY,RenderTargetType.WriteableBitmap);
 
             // ★ await 完了後に UI にセット
             VideoImage.Source = _imageSource;

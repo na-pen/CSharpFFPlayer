@@ -583,53 +583,66 @@ namespace CSharpFFPlayer
             Log("CUDA: kernel ready");
         }
 
+        // キャッシュ用フィールド
+        private int _cachedWidth;
+        private int _cachedHeight;
+        private int _cachedPitchOut;
+        private int _cachedBufSize;
+        private dim3 _cachedBlock;
+        private dim3 _cachedGrid;
+        private byte[] _hostBuffer;
+
+        private void EnsureCachedParams(int w, int h)
+        {
+            if (w == _cachedWidth && h == _cachedHeight)
+                return; // 解像度が同じなら再計算不要
+
+            _cachedWidth = w;
+            _cachedHeight = h;
+
+            _cachedPitchOut = w * 4;
+            _cachedBufSize = _cachedPitchOut * h;
+
+            _cachedBlock = new dim3(32, 16);
+            _cachedGrid = new dim3((w + 31) / 32, (h + 15) / 16);
+
+            // デバイス側バッファ確保
+            _decOutBgra?.Dispose();
+            _decOutBgra = new CudaDeviceVariable<byte>(_cachedBufSize);
+
+            // ホスト側バッファ確保
+            _hostBuffer = new byte[_cachedBufSize];
+
+            Log($"CUDA: setup for {w}x{h}, buf={_cachedBufSize} bytes");
+        }
+
         private unsafe byte[] ConvertCudaNV12FrameToBgra_OnDecodeThread(AVFrame* hwFrame, bool bt709 = true)
         {
             EnsureCudaOnDecodeThreadInitialized(hwFrame);
-            _decCudaCtx.SetCurrent(); // 念のため
+            _decCudaCtx.SetCurrent();
 
             int w = hwFrame->width;
             int h = hwFrame->height;
 
-            var frames = (AVHWFramesContext*)hwFrame->hw_frames_ctx->data;
-            var swfmt = (AVPixelFormat)frames->sw_format;
-            if (swfmt != AVPixelFormat.AV_PIX_FMT_NV12)
-                throw new NotSupportedException($"GPUカーネルは NV12 専用です（実際: {swfmt}）");
+            // 必要ならキャッシュ更新 & バッファ再確保
+            EnsureCachedParams(w, h);
 
-            var yDev = new CUdeviceptr((ulong)hwFrame->data[0]);
-            var uvDev = new CUdeviceptr((ulong)hwFrame->data[1]);
-            int pitchY = hwFrame->linesize[0];
-            int pitchUV = hwFrame->linesize[1];
-
-            if (yDev.Pointer == 0 || pitchY <= 0) throw new InvalidOperationException("Y plane invalid");
-            if (uvDev.Pointer == 0 || pitchUV <= 0) throw new InvalidOperationException("UV plane invalid");
-
-            int pitchOut = w * 4;
-            int bufSize = pitchOut * h;
-
-            if (_decOutBgra == null || _decOutBgra.Size < bufSize)
-            {
-                _decOutBgra?.Dispose();
-                _decOutBgra = new CudaDeviceVariable<byte>(bufSize);
-                Log($"CUDA: realloc out buffer = {bufSize} bytes");
-            }
-
-            _decNv12ToBgra.BlockDimensions = new dim3(32, 16);
-            _decNv12ToBgra.GridDimensions = new dim3((w + 31) / 32, (h + 15) / 16);
-            int useBT709 = bt709 ? 1 : 0;
+            _decNv12ToBgra.BlockDimensions = _cachedBlock;
+            _decNv12ToBgra.GridDimensions = _cachedGrid;
 
             _decNv12ToBgra.Run(
-                yDev, pitchY,
-                uvDev, pitchUV,
-                _decOutBgra.DevicePointer, pitchOut,
-                w, h, useBT709
+                new CUdeviceptr((ulong)hwFrame->data[0]), hwFrame->linesize[0],
+                new CUdeviceptr((ulong)hwFrame->data[1]), hwFrame->linesize[1],
+                _decOutBgra.DevicePointer, _cachedPitchOut,
+                _cachedWidth, _cachedHeight, bt709 ? 1 : 0
             );
             _decCudaCtx.Synchronize();
 
-            var host = new byte[bufSize];
-            _decOutBgra.CopyToHost(host);
-            return host;
+            _decOutBgra.CopyToHost(_hostBuffer);
+            return _hostBuffer;
         }
+
+
 
         /// <summary>
         /// CUDA ハードウェアフレーム(NV12)→BGRA。CPU フレームは conv にフォールバック。

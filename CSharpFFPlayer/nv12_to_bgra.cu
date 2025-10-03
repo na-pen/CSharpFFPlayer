@@ -1,4 +1,11 @@
-﻿extern "C" __global__
+﻿// ====== 定数メモリに LUT を配置 ======
+__constant__ int LUT_U_B[256];
+__constant__ int LUT_U_G[256];
+__constant__ int LUT_V_R[256];
+__constant__ int LUT_V_G[256];
+
+// ====== カーネル ======
+extern "C" __global__
 void Nv12ToBgraKernel(
     const unsigned char* __restrict__ yPlane, int pitchY,
     const unsigned char* __restrict__ uvPlane, int pitchUV,
@@ -10,28 +17,46 @@ void Nv12ToBgraKernel(
     if (x >= width || y >= height) return;
 
     int yIdx = y * pitchY + x;
-    int uvIdx = (y >> 1) * pitchUV + (x & ~1);
 
-    float Y = (float)yPlane[yIdx];
-    float U = (float)uvPlane[uvIdx + 0] - 128.0f;
-    float V = (float)uvPlane[uvIdx + 1] - 128.0f;
+    // ===== 2x2 グループで UV を共有 =====
+    int uvX = x & ~1;        
+    int uvY = y >> 1;
+    int uvIdx = uvY * pitchUV + uvX;
 
-    float cR = useBT709 ? 1.5748f : 1.4020f;
-    float cG1 = useBT709 ? 0.1873f : 0.3441f;
-    float cG2 = useBT709 ? 0.4681f : 0.7141f;
-    float cB = useBT709 ? 1.8556f : 1.7720f;
+    int U, V;
+    if ((threadIdx.x & 1) == 0 && (threadIdx.y & 1) == 0) {
+        U = (int)uvPlane[uvIdx + 0]; // 0〜255
+        V = (int)uvPlane[uvIdx + 1];
+    }
 
-    float Rf = Y + cR * V;
-    float Gf = Y - cG1 * U - cG2 * V;
-    float Bf = Y + cB * U;
+    unsigned mask = 0xffffffff;
+    U = __shfl_sync(mask, U, (threadIdx.x & ~1) + (threadIdx.y & ~1) * blockDim.x);
+    V = __shfl_sync(mask, V, (threadIdx.x & ~1) + (threadIdx.y & ~1) * blockDim.x);
 
-    unsigned char R = (unsigned char)(Rf < 0 ? 0 : (Rf > 255 ? 255 : Rf));
-    unsigned char G = (unsigned char)(Gf < 0 ? 0 : (Gf > 255 ? 255 : Gf));
-    unsigned char B = (unsigned char)(Bf < 0 ? 0 : (Bf > 255 ? 255 : Bf));
+    // ===== YUV → RGB 変換 (Y寄与 + LUT寄与) =====
+    int Y = (int)yPlane[yIdx];
+    int C = Y - 16;
+    if (C < 0) C = 0;
 
-    int o = y * pitchOut + x * 4;
-    outBGRA[o + 0] = B;
-    outBGRA[o + 1] = G;
-    outBGRA[o + 2] = R;
-    outBGRA[o + 3] = 255;
+    int Yterm = (298 * C + 128) >> 8;  // Y寄与（共通部分）
+
+    int idxU = U; // 0〜255
+    int idxV = V;
+
+    int R = Yterm + LUT_V_R[idxV];
+    int G = Yterm + LUT_U_G[idxU] + LUT_V_G[idxV];
+    int B = Yterm + LUT_U_B[idxU];
+
+    // clamp
+    R = R < 0 ? 0 : (R > 255 ? 255 : R);
+    G = G < 0 ? 0 : (G > 255 ? 255 : G);
+    B = B < 0 ? 0 : (B > 255 ? 255 : B);
+
+    uchar4 out;
+    out.x = (unsigned char)B;
+    out.y = (unsigned char)G;
+    out.z = (unsigned char)R;
+    out.w = 255;
+
+    ((uchar4*)outBGRA)[y * (pitchOut / 4) + x] = out;
 }
