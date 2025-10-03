@@ -350,6 +350,7 @@ namespace CSharpFFPlayer
             return info;
         }
 
+        private AVHWDeviceType? hwType = null;
         /// <summary>
         /// 映像・音声デコーダを初期化し、必要ならハードウェアコンテキストを作成。
         /// </summary>
@@ -377,10 +378,11 @@ namespace CSharpFFPlayer
                     (AVHWDeviceType?)null;
 
                 // ハードウェアデバイス初期化
-                if (videoHardwareType is AVHWDeviceType hwType)
+                if (videoHardwareType is AVHWDeviceType _hwType)
                 {
+                    hwType = _hwType;
                     AVBufferRef* hw_device_ctx = null;
-                    int result = ffmpeg.av_hwdevice_ctx_create(&hw_device_ctx, hwType, null, null, 0);
+                    int result = ffmpeg.av_hwdevice_ctx_create(&hw_device_ctx, (AVHWDeviceType)hwType, null, null, 0);
                     if (result >= 0)
                     {
                         videoCodecContext->hw_device_ctx = ffmpeg.av_buffer_ref(hw_device_ctx);
@@ -572,7 +574,7 @@ namespace CSharpFFPlayer
             {
                 return (result, null);
             }
-            return (result, new ManagedFrame(frame));
+            return (result, new ManagedFrame(frame,hwType));
         }
 
         private unsafe AVFrame* TryReadUnsafeFrame(out FrameReadResult result)
@@ -670,7 +672,7 @@ namespace CSharpFFPlayer
         public unsafe (FrameReadResult result, ManagedFrame frame) TryReadAudioFrame()
         {
             var frame = TryReadUnsafeAudioFrame(out var result);
-            return (result, frame == null ? null : new ManagedFrame(frame));
+            return (result, frame == null ? null : new ManagedFrame(frame,hwType));
         }
 
         /// <summary>

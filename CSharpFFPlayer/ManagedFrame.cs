@@ -5,7 +5,7 @@ public unsafe class ManagedFrame : IDisposable
     private AVFrame* frame;
     private bool isDisposed;
 
-    public ManagedFrame(AVFrame* frame) { this.frame = frame; }
+    public ManagedFrame(AVFrame* frame,AVHWDeviceType? HwDeviceType) { this.frame = frame; this.HwDeviceType = HwDeviceType; }
 
     public AVFrame* Frame => frame;
 
@@ -14,6 +14,8 @@ public unsafe class ManagedFrame : IDisposable
     public bool IsGpuFrame => isGpuFrame;
 
     public long Index = -1;
+
+    public AVHWDeviceType? HwDeviceType = null;
 
     /// <summary>
     /// GPUフレームならCPUへ転送する。既にCPUなら何もしない。

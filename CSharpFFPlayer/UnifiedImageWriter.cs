@@ -118,14 +118,13 @@ namespace CSharpFFPlayer
 
             try
             {
-                if (latest.IsGpuFrame)
-                {
-                    unsafe { latest.GetCpuFrame(); }
-                    unsafe { if (latest.Frame == null) return; }
-                }
-
                 if (targetType == RenderTargetType.WriteableBitmap)
                 {
+                    if (latest.IsGpuFrame)
+                    {
+                        unsafe { latest.GetCpuFrame(); }
+                        unsafe { if (latest.Frame == null) return; }
+                    }
                     RenderToWriteableBitmap(latest);
                 }
                 else if (targetType == RenderTargetType.D3DImage)

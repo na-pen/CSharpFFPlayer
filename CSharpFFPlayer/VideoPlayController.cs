@@ -82,6 +82,8 @@ namespace CSharpFFPlayer
         // 自動再開を許可するか（Play で true、Pause/Seek 後は false）
         private volatile bool allowAutoResume = false;
 
+        private RenderTargetType targetType;
+
 
         /// <summary>
         /// ファイルを開いて FFmpeg デコーダーを初期化
@@ -119,8 +121,9 @@ namespace CSharpFFPlayer
         /// <summary>
         /// 最初のフレームを取得し、WPF 描画用の WriteableBitmap を作成する
         /// </summary>
-        public async Task<ImageSource> CreateBitmapAsync(int dpiX, int dpiY, RenderTargetType targetType)
+        public async Task<ImageSource> CreateBitmapAsync(int dpiX, int dpiY, RenderTargetType _targetType)
         {
+            targetType = _targetType;
             if (decoder is null)
                 throw new InvalidOperationException("動画を開いてから描画先を作成してください。");
 
@@ -189,7 +192,7 @@ namespace CSharpFFPlayer
                 {
                     frameConveter.Configure(width, height, srcFormat, width, height, AVPixelFormat.AV_PIX_FMT_BGRA);
                     var di = new D3DImage();
-                    imageWriter = new UnifiedImageWriter(RenderTargetType.D3DImage, width, height, frameConveter, di : di);
+                    imageWriter = new UnifiedImageWriter(RenderTargetType.D3DImage, width, height, frameConveter, di: di);
 
                     output = di;
                 }
@@ -468,22 +471,47 @@ namespace CSharpFFPlayer
                 // ---- バッファ監視（ヒステリシス + グレース期間）----
                 if (playbackState == PlaybackState.Playing)
                 {
-                    if (cpuFrames.Count < LOW_WATERMARK && (!resumed || resumeGrace.ElapsedMilliseconds > RESUME_GRACE_MS))
+                    if(targetType == RenderTargetType.WriteableBitmap)
                     {
-                        audioPlayer?.Pause();
-                        playbackState = PlaybackState.Buffering;
+                        if (cpuFrames.Count < LOW_WATERMARK && (!resumed || resumeGrace.ElapsedMilliseconds > RESUME_GRACE_MS))
+                        {
+                            audioPlayer?.Pause();
+                            playbackState = PlaybackState.Buffering;
+                        }
                     }
+                    else if(targetType == RenderTargetType.D3DImage)
+                    {
+                        if (gpuFrames.Count < LOW_WATERMARK && (!resumed || resumeGrace.ElapsedMilliseconds > RESUME_GRACE_MS))
+                        {
+                            audioPlayer?.Pause();
+                            playbackState = PlaybackState.Buffering;
+                        }
+                    }
+                    
                 }
                 else if (playbackState == PlaybackState.Buffering)
                 {
-                    if (cpuFrames.Count >= HIGH_WATERMARK)
+                    if (targetType == RenderTargetType.WriteableBitmap)
                     {
-                        if (allowAutoResume)
-                            playbackState = PlaybackState.Playing;
-                        else
-                            playbackState = PlaybackState.Paused;
+                        if (cpuFrames.Count >= HIGH_WATERMARK)
+                        {
+                            if (allowAutoResume)
+                                playbackState = PlaybackState.Playing;
+                            else
+                                playbackState = PlaybackState.Paused;
+                        }
                     }
-                }
+                    else if (targetType == RenderTargetType.D3DImage)
+                    {
+                        if (gpuFrames.Count >= HIGH_WATERMARK)
+                        {
+                            if (allowAutoResume)
+                                playbackState = PlaybackState.Playing;
+                            else
+                                playbackState = PlaybackState.Paused;
+                        }
+                    }
+                    }
 
                 // 状態遷移検出
                 if (playbackState != lastState)
@@ -515,11 +543,23 @@ namespace CSharpFFPlayer
                     // 再生開始前のプリフェッチ
                     const int PREFILL_TARGET = CPU_FRAME_TARGET / 2;
                     int retry = 0;
-                    while (cpuFrames.Count < PREFILL_TARGET && retry < 500) // 最大 500ms 待機
+                    if (targetType == RenderTargetType.WriteableBitmap)
                     {
-                        await Task.Delay(5);
-                        retry++;
+                        while (cpuFrames.Count < PREFILL_TARGET && retry < 500) // 最大 500ms 待機
+                        {
+                            await Task.Delay(5);
+                            retry++;
+                        }
                     }
+                    else if (targetType == RenderTargetType.D3DImage)
+                    {
+                        while (gpuFrames.Count < PREFILL_TARGET && retry < 500) // 最大 500ms 待機
+                        {
+                            await Task.Delay(5);
+                            retry++;
+                        }
+                    }
+                    
 
 
                     // 2) 音声位置から理想フレームを算出
@@ -529,16 +569,28 @@ namespace CSharpFFPlayer
                     // 3) セーフティマージン：理想位置の2フレ前から再開できるよう破棄を控えめに
                     const int SAFETY_MARGIN = 2;
                     long cutoffIndex = Math.Max(0, idealFrameIndex - SAFETY_MARGIN);
-                    while (cpuFrames.TryPeek(out var peeked))
+                    if (targetType == RenderTargetType.WriteableBitmap)
                     {
-                        long peekedIdx = peeked.Index;
-                        if (peekedIdx >= cutoffIndex) break;
-                        if (cpuFrames.TryDequeue(out var skipped)) skipped.Dispose();
+                        while (cpuFrames.TryPeek(out var peeked))
+                        {
+                            long peekedIdx = peeked.Index;
+                            if (peekedIdx >= cutoffIndex) break;
+                            if (cpuFrames.TryDequeue(out var skipped)) skipped.Dispose();
+                        }
+                    }
+                    else if (targetType == RenderTargetType.D3DImage)
+                    {
+                        while (gpuFrames.TryPeek(out var peeked))
+                        {
+                            long peekedIdx = peeked.Index;
+                            if (peekedIdx >= cutoffIndex) break;
+                            if (gpuFrames.TryDequeue(out var skipped)) skipped.Dispose();
+                        }
                     }
 
 
-                    // 4) プロデューサがさらに追いつく小休止
-                    await Task.Delay((int)(baseFrameDurationMs * 3));
+                        // 4) プロデューサがさらに追いつく小休止
+                        await Task.Delay((int)(baseFrameDurationMs * 3));
 
                     // 5) フレーム内オフセット待ち
                     int remainingDelayMs = (int)timeInFrame.TotalMilliseconds;
@@ -552,12 +604,12 @@ namespace CSharpFFPlayer
 
                 // ---- フレーム取得 → 最新フレームとして提示（描画は Rendering で）----
                 // 再生ループ内
-                var frame = DequeueCpuFrame();
+                var frame = DequeueFrame();
                 if (frame != null)
                 {
                     try
                     {
-                        if (frame.IsGpuFrame)
+                        if (frame.IsGpuFrame && targetType == RenderTargetType.WriteableBitmap)
                         {
                             unsafe { frame.GetCpuFrame(); } // ★ここでCPU転送を強制
                         }
@@ -740,14 +792,26 @@ namespace CSharpFFPlayer
         /// </summary>
         private async Task WaitForBuffer()
         {
-            // CPUフレームキューを監視
-            while ((cpuFrames.Count < CPU_FRAME_TARGET / 2 || isSeeking) &&
-                   (playbackState == PlaybackState.Playing ||
-                    playbackState == PlaybackState.Paused ||
-                    playbackState == PlaybackState.SeekBuffering))
-            {
-                await Task.Delay(waitTime);
+            if (targetType == RenderTargetType.WriteableBitmap)
+            {             // CPUフレームキューを監視
+                while ((cpuFrames.Count < CPU_FRAME_TARGET / 2 || isSeeking) &&
+                       (playbackState == PlaybackState.Playing ||
+                        playbackState == PlaybackState.Paused ||
+                        playbackState == PlaybackState.SeekBuffering))
+                {
+                    await Task.Delay(waitTime);
+                }
             }
+            else if (targetType == RenderTargetType.D3DImage) {
+                while ((gpuFrames.Count < CPU_FRAME_TARGET / 2 || isSeeking) &&
+                           (playbackState == PlaybackState.Playing ||
+                            playbackState == PlaybackState.Paused ||
+                            playbackState == PlaybackState.SeekBuffering))
+                    {
+                    await Task.Delay(waitTime);
+                }
+            }
+
         }
 
 
@@ -1000,7 +1064,7 @@ namespace CSharpFFPlayer
         {
             while (playbackState != PlaybackState.Stopped)
             {
-                if (isSeeking)
+                if (isSeeking || targetType == RenderTargetType.D3DImage)
                 {
                     await Task.Delay(30);
                     continue;
@@ -1025,6 +1089,20 @@ namespace CSharpFFPlayer
 
                 await Task.Delay(1);
             }
+        }
+
+        public ManagedFrame? DequeueFrame()
+        {
+            if (targetType == RenderTargetType.WriteableBitmap)
+            {
+                return DequeueCpuFrame();
+            }
+            else if (targetType == RenderTargetType.D3DImage)
+            {
+                if (gpuFrames.TryDequeue(out var gpuFrame))
+                    return gpuFrame;
+            }
+            return null;
         }
 
         public ManagedFrame? DequeueCpuFrame()
