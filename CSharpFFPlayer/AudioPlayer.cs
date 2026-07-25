@@ -2,6 +2,7 @@
 using NAudio.CoreAudioApi;
 using NAudio.Wave.SampleProviders;
 using System;
+using System.Buffers;
 using System.IO;
 using System.Threading.Tasks;
 using System.Diagnostics.Eventing.Reader;
@@ -196,13 +197,23 @@ namespace CSharpFFPlayer
         {
             if (bufferedWaveProvider == null) return;
 
+            if (audioData.IsEmpty) return;
+
+            // NAudio の AddSamples は byte[] しか受け取らないが、内部でリングバッファへ
+            // コピーされるだけなので、毎回 ToArray() せず ArrayPool から借りて使い回す。
+            byte[] rented = ArrayPool<byte>.Shared.Rent(audioData.Length);
             try
             {
-                bufferedWaveProvider.AddSamples(audioData.ToArray(), 0, audioData.Length);
+                audioData.CopyTo(rented);
+                bufferedWaveProvider.AddSamples(rented, 0, audioData.Length);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[Audio] Error while adding data: {ex.Message}");
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
             }
         }
 

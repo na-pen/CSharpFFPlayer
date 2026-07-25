@@ -141,8 +141,6 @@ namespace CSharpFFPlayer
         // シーク/終了フラグ類
         private volatile bool isSeeking = false;
         private long seekPrefetchEndFrameIndex = -1;
-        private bool endedStreamVideo = false;
-        private bool endedStreamAudio = false;
 
         // フレーム番号推定のための観測値
         private volatile int frameIndexFactor = 1;
@@ -451,6 +449,9 @@ namespace CSharpFFPlayer
             audioPlayer?.Dispose();
             decoder?.Dispose();
 
+            // 使い回している SwrContext も解放する
+            AudioFrameConveter.ReleaseCachedContext();
+
             Log("再生停止。リソース解放済み。");
         }
 
@@ -685,7 +686,7 @@ namespace CSharpFFPlayer
                         if (pts > targetAudioPts + 1) { audioFrame.Dispose(); break; }
 
                         using var pcm = AudioFrameConveter.ConvertTo<PCMInt16Format>(audioFrame);
-                        audioPlayer.AddAudioData(pcm.AsMemory().Span);
+                        audioPlayer.AddAudioData(pcm.AsSpan());
                         audioFrame.Dispose();
                     }
 
@@ -1095,6 +1096,12 @@ namespace CSharpFFPlayer
                 const int retryDelayMs = 10;
                 int retryCount = 0;
 
+                // AVStream はサイズの大きい構造体で、プロパティ経由の取得は毎回コピーになる。
+                // time_base は再生中変わらないのでループ外で 1 度だけ取る。
+                AVRational audioTimeBase;
+                unsafe { audioTimeBase = decoder.AudioStream.time_base; }
+                var frameRateInv = new AVRational { num = videoFps.den, den = videoFps.num };
+
                 while (playbackState != PlaybackState.Stopped)
                 {
                     if (isSeeking) { await Task.Delay(50); continue; }
@@ -1114,17 +1121,34 @@ namespace CSharpFFPlayer
 
                     if (rr == FrameReadResult.FrameAvailable && audioFrame != null)
                     {
+                        bool skip = false;
                         unsafe
                         {
                             long pts = audioFrame.Frame->pts;
                             if (pts == ffmpeg.AV_NOPTS_VALUE) pts = audioFrame.Frame->best_effort_timestamp;
 
-                            if (seekPrefetchEndFrameIndex >= 0 && pts <= seekPrefetchEndFrameIndex) { audioFrame.Dispose(); continue; }
-                            if (audioFrame.Frame == null || audioFrame.Frame->nb_samples <= 0) { audioFrame.Dispose(); continue; }
+                            // seekPrefetchEndFrameIndex は「映像のフレーム番号」なので、
+                            // 音声の time_base に換算してから比較する。
+                            // （以前は単位の違う値をそのまま比較していた）
+                            if (seekPrefetchEndFrameIndex >= 0)
+                            {
+                                long minAudioPts = ffmpeg.av_rescale_q(
+                                    seekPrefetchEndFrameIndex, frameRateInv, audioTimeBase);
+
+                                if (pts < minAudioPts) skip = true;
+                            }
+
+                            if (!skip && (audioFrame.Frame == null || audioFrame.Frame->nb_samples <= 0)) skip = true;
                         }
 
-                        var pcm = AudioFrameConveter.ConvertTo<PCMInt16Format>(audioFrame);
-                        audioPlayer.AddAudioData(pcm.AsMemory().Span);
+                        if (skip) { audioFrame.Dispose(); continue; }
+
+                        // AudioData はアンマネージドバッファを持つので必ず解放する。
+                        // AsSpan() はコピーを挟まない（AsMemory() は byte[] を作ってしまう）。
+                        using (var pcm = AudioFrameConveter.ConvertTo<PCMInt16Format>(audioFrame))
+                        {
+                            audioPlayer.AddAudioData(pcm.AsSpan());
+                        }
                         audioFrame.Dispose();
                         retryCount = 0;
                     }
@@ -1135,7 +1159,10 @@ namespace CSharpFFPlayer
                     }
                     else if (rr == FrameReadResult.EndOfStream)
                     {
-                        endedStreamAudio = true;
+                        // 以前はフラグを立てるだけで即ループ先頭に戻っていたため、
+                        // 音声終端に達すると TryReadAudioFrame を全力で叩き続けていた。
+                        // シークで戻る可能性があるのでループ自体は維持しつつ待つ。
+                        await Task.Delay(100);
                     }
                 }
             }
@@ -1210,7 +1237,6 @@ namespace CSharpFFPlayer
             {
                 FlushQueues();
                 Interlocked.Exchange(ref lastEnqueuedFrameIndex, -1);
-                endedStreamVideo = false;
 
                 ResetIndexObservation(); // フレーム番号推定をリセット
                 await ResetDecoderCoreAsync(seekPts);

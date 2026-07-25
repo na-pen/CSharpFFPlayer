@@ -46,8 +46,6 @@ namespace CSharpFFPlayer
         private AVHWDeviceType? videoHardwareType = null;
         private AVHWDeviceType? hwType = null;
 
-        private bool isVideoFrameEnded;
-        private bool isAudioFrameEnded;
         private bool isDisposed;
 
         // --- CUDA (decode-thread 専有) ---
@@ -455,13 +453,13 @@ namespace CSharpFFPlayer
                     ffmpeg.avcodec_send_packet(videoCodecContext, null);
                     r = ffmpeg.avcodec_receive_frame(videoCodecContext, f);
                     if (r == 0) { result = FrameReadResult.FrameAvailable; return f; }
-                    if (r == ffmpeg.AVERROR_EOF) { isVideoFrameEnded = true; ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
+                    if (r == ffmpeg.AVERROR_EOF) { ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
                 }
 
                 if (r == FFmpegErrors.AVERROR_EAGAIN) { ffmpeg.av_frame_free(&f); result = FrameReadResult.FrameNotReady; return null; }
             }
 
-            if (r == ffmpeg.AVERROR_EOF) { isVideoFrameEnded = true; ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
+            if (r == ffmpeg.AVERROR_EOF) { ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
 
             ffmpeg.av_frame_free(&f);
             ThrowIfErr(r, "avcodec_receive_frame(video)");
@@ -496,13 +494,13 @@ namespace CSharpFFPlayer
                     ffmpeg.avcodec_send_packet(audioCodecContext, null);
                     r = ffmpeg.avcodec_receive_frame(audioCodecContext, f);
                     if (r == 0) { result = FrameReadResult.FrameAvailable; return f; }
-                    if (r == ffmpeg.AVERROR_EOF) { isAudioFrameEnded = true; ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
+                    if (r == ffmpeg.AVERROR_EOF) { ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
                 }
 
                 if (r == FFmpegErrors.AVERROR_EAGAIN) { ffmpeg.av_frame_free(&f); result = FrameReadResult.FrameNotReady; return null; }
             }
 
-            if (r == ffmpeg.AVERROR_EOF) { isAudioFrameEnded = true; ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
+            if (r == ffmpeg.AVERROR_EOF) { ffmpeg.av_frame_free(&f); result = FrameReadResult.EndOfStream; return null; }
 
             ffmpeg.av_frame_free(&f);
             ThrowIfErr(r, "avcodec_receive_frame(audio)");
@@ -516,25 +514,12 @@ namespace CSharpFFPlayer
             {
                 while (videoPackets.Count > 0) videoPackets.Dequeue()?.Dispose();
                 while (audioPackets.Count > 0) audioPackets.Dequeue()?.Dispose();
-                isVideoFrameEnded = false;
-                isAudioFrameEnded = false;
             }
         }
 
         // ====================== CUDA: NV12 → BGRA ======================
         [StructLayout(LayoutKind.Sequential)]
         private struct AVCUDADeviceContext { public IntPtr cuda_ctx; }
-
-        // ==== CUDA fast path fields ====
-        private CudaStream _decStream;                      // ★ 非同期実行用
-        private CudaPageLockedHostMemory<byte> _hostPinned;  // ★ page-locked (pinned) host
-        private byte[] _poolBuf;                              // 互換: ArrayPoolを使わない場合の再利用バッファ(任意)
-
-        private int _curW, _curH, _curPitchOut;
-        private dim3 _grid, _block;
-        private byte[] _ptxCache;                             // PTXを1回だけ読む
-        private int _creatorManagedThreadId;                  // このデコードスレッド（current ctx 再設定抑制）
-
 
         private unsafe void EnsureCudaOnDecodeThreadInitialized(AVFrame* hwFrame)
         {
