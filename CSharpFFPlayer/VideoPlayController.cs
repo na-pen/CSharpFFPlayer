@@ -78,6 +78,15 @@ namespace CSharpFFPlayer
         private const int RESUME_GRACE_MS = 250;         // 再開直後のグレース期間
         private const int LOW_WATER_DIV = 3;             // LOW=TARGET/3
         private const int PREFILL_DIV = 2;               // 再開前プリフィル=TARGET/2
+        private const int NO_FRAME_WAIT_MS = 2;          // 提示できるフレームが無いときの待機
+        private const int LATE_RESYNC_FRAMES = 3;        // この枚数以上遅れたら理想時刻を再同期
+
+        /// <summary>
+        /// フレーム毎の [Draw] ログを出すか。
+        /// ペーシングの検証用。Console 出力は描画ループ上では重いため、
+        /// 確認が済んだら false にしてよい。
+        /// </summary>
+        public bool VerboseDrawLog { get; set; } = true;
 
         // --- 状態 ---
         private PlaybackState playbackState = PlaybackState.Stopped;
@@ -588,8 +597,21 @@ namespace CSharpFFPlayer
                 audioPlayer.Start();
 
                 var sw = Stopwatch.StartNew();
+                double tickToMs = 1000.0 / Stopwatch.Frequency;
+
+                // 「次にフレームを提示すべき理想時刻(ms)」を絶対値で保持する。
+                // 1 フレームごとに baseFrameDurationMs を加算していくため、
+                // Task.Delay の整数丸め誤差やスリープのブレが累積しない。
+                // float だと長時間再生で刻み幅が足りなくなるので double。
+                double nextPresentMs = sw.ElapsedTicks * tickToMs;
+
+                // 提示を伴わない待機（一時停止・再開同期・フレーム欠落）のあとは
+                // 理想時刻を取り直す。取り直さないと「遅れた分の一括追いつき」で
+                // フレームが早送り再生されてしまう。
+                bool clockDirty = false;
+
+                // 実測のフレーム間隔（ログ用）
                 long lastTicks = sw.ElapsedTicks;
-                float tickToMs = 1000.0f / Stopwatch.Frequency;
 
                 bool resumed = false;
                 var resumeGrace = new Stopwatch();
@@ -633,6 +655,7 @@ namespace CSharpFFPlayer
                     // 停止系は少し待つ
                     if (playbackState is PlaybackState.Paused or PlaybackState.Buffering or PlaybackState.SeekBuffering or PlaybackState.Seeking)
                     {
+                        clockDirty = true;
                         await Task.Delay(100);
                         continue;
                     }
@@ -658,51 +681,110 @@ namespace CSharpFFPlayer
                         audioPlayer.Resume();
                         resumed = true;
                         resumeGrace.Restart();
+
+                        // ここまでで 100ms 以上待っているため理想時刻を取り直す
+                        clockDirty = true;
+                    }
+
+                    // 提示を伴わない待機のあとは理想時刻の基準を取り直す
+                    if (clockDirty)
+                    {
+                        long anchor = sw.ElapsedTicks;
+                        nextPresentMs = anchor * tickToMs;
+                        lastTicks = anchor;
+                        clockDirty = false;
                     }
 
                     // --- フレーム取得→提示 ---
                     var mf = DequeueForTarget();
-                    float delay = 0f;
+                    if (mf == null)
+                    {
+                        // キューが空。Task.Delay(0) は同期完了しビジーループになるため必ず待つ。
+                        // 理想時刻は進めないので、フレームが供給されれば遅れを取り戻せる。
+                        await Task.Delay(NO_FRAME_WAIT_MS);
+                        continue;
+                    }
+
+                    bool presented = false;
                     unsafe
                     {
-                        if (mf != null && mf.Frame != null)
+                        if (mf.Frame == null)
+                        {
+                            mf.Dispose();
+                        }
+                        else
                         {
                             try
                             {
                                 if (IsCpuTarget && mf.IsGpuFrame)
                                 {
-                                    unsafe { mf.GetCpuFrame(); }
-                                    unsafe { if (mf.Frame == null) { mf.Dispose(); continue; } }
+                                    mf.GetCpuFrame();
                                 }
 
-                                // UIへ提示（CPU/D3D を吸収）
-                                EnqueueForUi(mf);
+                                if (mf.Frame == null)
+                                {
+                                    mf.Dispose();
+                                }
+                                else
+                                {
+                                    // UIへ提示（CPU/D3D を吸収）
+                                    EnqueueForUi(mf);
 
-                                frameIndex = (int)(mf.Index < 0 ? frameIndex + 1 : mf.Index);
+                                    frameIndex = (int)(mf.Index < 0 ? frameIndex + 1 : mf.Index);
+                                    presented = true;
+                                }
                             }
                             catch (Exception ex)
                             {
                                 Err($"[Present] {ex.Message}");
                                 mf.Dispose();
                             }
-
-
-                            // --- 音声との微調整 ---
-                            double aSec = (double)audioPlayer.GetPosition() / audioPlayer.AverageBytesPerSecond;
-                            var (idealIdx2, inFrame2) = GetCurrentFrameInfo(TimeSpan.FromSeconds(aSec));
-                            int diff = idealIdx2 - frameIndex;
-                            float offset = (float)inFrame2.TotalMilliseconds + diff * baseFrameDurationMs;
-
-                            long nowTicks = sw.ElapsedTicks;
-                            float usedMs = (nowTicks - lastTicks) * tickToMs;
-                            delay = MathF.Max(0, baseFrameDurationMs - usedMs - offset);
-                            Console.WriteLine($"[Draw] idx={frameIndex} used={usedMs}ms delay={delay}ms");
                         }
                     }
 
-                    await Task.Delay((int)delay);
+                    if (!presented)
+                    {
+                        // 提示できなかったフレームでは理想時刻を進めない
+                        clockDirty = true;
+                        await Task.Delay(NO_FRAME_WAIT_MS);
+                        continue;
+                    }
 
-                    lastTicks = sw.ElapsedTicks;
+                    // --- 音声との微調整 ---
+                    double aSec = (double)audioPlayer.GetPosition() / audioPlayer.AverageBytesPerSecond;
+                    var (idealIdx2, inFrame2) = GetCurrentFrameInfo(TimeSpan.FromSeconds(aSec));
+                    int diff = idealIdx2 - frameIndex;
+                    // 音声に対する映像のズレ(ms)。正なら映像が遅れている。
+                    double offset = inFrame2.TotalMilliseconds + diff * baseFrameDurationMs;
+
+                    // 理想時刻は 1 フレーム分だけ進める。
+                    // offset はこの後の待ち時間にのみ効かせる（両方に適用すると補正が二重になり発振する）。
+                    nextPresentMs += baseFrameDurationMs;
+
+                    long nowTicks = sw.ElapsedTicks;
+                    double nowMs = nowTicks * tickToMs;
+                    double err = nowMs - nextPresentMs;   // 正なら理想時刻より遅れている
+
+                    // 大きく遅れた場合は理想時刻を現在に引き戻す（遅れ分の一括追いつきを防ぐ）
+                    if (err > baseFrameDurationMs * LATE_RESYNC_FRAMES)
+                    {
+                        Warn($"[Draw] {err:F1}ms 遅延のため理想時刻を再同期");
+                        nextPresentMs = nowMs;
+                        err = 0;
+                    }
+
+                    double waitMs = (nextPresentMs - nowMs) - offset;
+
+                    double usedMs = (nowTicks - lastTicks) * tickToMs;
+                    lastTicks = nowTicks;
+
+                    if (VerboseDrawLog)
+                        Console.WriteLine($"[Draw] idx={frameIndex} used={usedMs:F2}ms wait={waitMs:F2}ms err={err:F2}ms offset={offset:F2}ms");
+
+                    if (waitMs > 0)
+                        await Task.Delay((int)Math.Round(waitMs));
+                    else
+                        await Task.Yield();   // 遅れている時も必ずスレッドを手放す
                 }
             }
             catch (Exception e)
