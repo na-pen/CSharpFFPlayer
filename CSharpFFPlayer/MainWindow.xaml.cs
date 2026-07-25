@@ -216,7 +216,51 @@ namespace CSharpFFPlayer
         private async void Window_KeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key == Key.Space)
+            {
+                e.Handled = true;
                 await TogglePlayPauseAsync();
+                return;
+            }
+
+            if (e.Key == Key.Right)
+            {
+                e.Handled = true;
+                await StepForwardOneFrameAsync();
+            }
+        }
+
+        /// <summary>
+        /// コマ送り（メニュー用）
+        /// </summary>
+        private async void StepForward_Click(object sender, RoutedEventArgs e) =>
+            await StepForwardOneFrameAsync();
+
+        /// <summary>
+        /// コマ送りを 1 回実行し、シークバーと時間表示を追従させる
+        /// </summary>
+        private async Task StepForwardOneFrameAsync()
+        {
+            if (_videoPlayController == null) return;
+
+            try
+            {
+                if (!await _videoPlayController.StepForwardAsync())
+                {
+                    Console.WriteLine("[コマ送り] 次のフレームを取得できませんでした。");
+                    return;
+                }
+
+                long current = _videoPlayController.FrameIndex;
+                SeekSlider.Value = current;
+
+                double fps = _videoPlayController.VideoInfo.VideoStreams.FirstOrDefault()?.Fps ?? 0;
+                if (fps > 0)
+                    CurrentTimeDisplay = FormatTime(TimeSpan.FromSeconds(current / fps));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[エラー] コマ送り: {ex}");
+            }
         }
 
         /// <summary>

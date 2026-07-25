@@ -52,6 +52,15 @@
                                 TextAlignment="Left" />
                         </MenuItem.Header>
                     </MenuItem>
+                    <MenuItem Height="23" Click="StepForward_Click">
+                        <MenuItem.Header>
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                FontSize="13"
+                                Text="コマ送り (→)"
+                                TextAlignment="Left" />
+                        </MenuItem.Header>
+                    </MenuItem>
                     <MenuItem Height="23" Click="StopButton_Click">
                         <MenuItem.Header>
                             <TextBlock
@@ -149,7 +158,10 @@ Panel.ZIndex="100">
                         Grid.Column="1"
                         Margin="20,0,20,0"
                         VerticalAlignment="Center"
+                        Focusable="False"
                         IsSnapToTickEnabled="True"
+                        IsTabStop="False"
+                        KeyboardNavigation.TabNavigation="None"
                         Maximum="{Binding TotalFrames}"
                         Minimum="0"
                         PreviewMouseDown="SeekSlider_PreviewMouseDown"

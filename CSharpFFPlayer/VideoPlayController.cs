@@ -80,6 +80,7 @@ namespace CSharpFFPlayer
         private const int PREFILL_DIV = 2;               // 再開前プリフィル=TARGET/2
         private const int NO_FRAME_WAIT_MS = 2;          // 提示できるフレームが無いときの待機
         private const int LATE_RESYNC_FRAMES = 3;        // この枚数以上遅れたら理想時刻を再同期
+        private const int DRAW_LOOP_PARK_MS = 10;        // 描画ループが停止するまでの余裕
 
         /// <summary>
         /// フレーム毎の [Draw] ログを出すか。
@@ -131,6 +132,11 @@ namespace CSharpFFPlayer
 
         // 再生再開を許可するか（Play で true、Pause/Seek 後は false）
         private volatile bool allowAutoResume = false;
+
+        // コマ送りで映像だけ進めた結果、音声位置がずれているか。
+        // コマ送りのたびに音声シークを走らせると AVFormatContext（映像と共用）が
+        // 動いてしまうため、再開時にまとめて合わせる。
+        private volatile bool needsAudioResync = false;
 
         // シーク/終了フラグ類
         private volatile bool isSeeking = false;
@@ -402,6 +408,14 @@ namespace CSharpFFPlayer
             }
             else
             {
+                // コマ送りで映像だけ進めていた場合、ここで映像・音声とも現在位置に揃える。
+                // （コマ送り毎に音声シークすると共用の AVFormatContext が動いてしまう）
+                if (needsAudioResync)
+                {
+                    Log("[Play] コマ送り分の位置を再同期します。");
+                    await SeekToExactFrameAsync(frameIndex);
+                }
+
                 allowAutoResume = true;
                 SetState(PlaybackState.Playing, "Play (resume)");
             }
@@ -478,22 +492,14 @@ namespace CSharpFFPlayer
                     break;
                 }
 
-                // 4) UI に提示。CPU/D3D で入れる先を分ける
+                // 4) UI に提示（CPU/D3D 共通）。
+                //    提示処理でフレームは消費されるためキューには戻さない。
+                //    以前は CPU 経路で「表示用」と「キュー用」に同じフレームを二重登録しており、
+                //    また D3D 経路では表示せずキューに積むだけだったため、
+                //    一時停止中にシークしても画面が更新されなかった。
                 if (targetFrame != null)
                 {
-                    // 描画ターゲット差し替えと排他
-                    lock (renderSwapGate)
-                    {
-                        if (IsCpuTarget)
-                        {
-                            imageWriter?.EnqueueFrame(targetFrame);
-                            cpuFrames.Enqueue(targetFrame);
-                        }
-                        else
-                        {
-                            gpuFrames.Enqueue(targetFrame);
-                        }
-                    }
+                    PresentSingleFrame(targetFrame, targetFrameIndex);
                 }
                 else
                 {
@@ -503,6 +509,7 @@ namespace CSharpFFPlayer
 
                 // 5) 音声も合わせる
                 await SeekAudioAsync(frameIndex);
+                needsAudioResync = false;
 
                 // 6) バッファ待機後、停止状態に（自動再開はしない）
                 await WaitForBuffer();
@@ -517,6 +524,121 @@ namespace CSharpFFPlayer
             {
                 seekLock.Release();
             }
+        }
+
+        // ----------------------------------
+        // 公開：コマ送り
+        // ----------------------------------
+        /// <summary>
+        /// コマ送り。一時停止したまま次のフレームを 1 枚だけ表示する。
+        /// 再生中に呼ばれた場合は一時停止してから進める。
+        /// バッファに次のフレームが無ければシークで取りに行く。
+        /// </summary>
+        public async Task<bool> StepForwardAsync()
+        {
+            if (decoder == null || imageWriter == null || frameConveter == null) return false;
+
+            if (playbackState is PlaybackState.Stopped or PlaybackState.Ended)
+            {
+                Warn("[Step] 停止中／再生終了後はコマ送りできません。");
+                return false;
+            }
+
+            long target = frameIndex + 1;
+            bool needSeek = false;
+
+            if (!await seekLock.WaitAsync(0))
+            {
+                Warn("[Step] シーク／コマ送りの二重実行は無視されました。");
+                return false;
+            }
+
+            try
+            {
+                // 再生中なら止める。描画ループが今のフレームを出し終えるまで待つ。
+                if (playbackState != PlaybackState.Paused)
+                {
+                    Pause();
+                    await Task.Delay((int)baseFrameDurationMs + DRAW_LOOP_PARK_MS);
+                }
+
+                // 停止するまでに描画ループが進んでいる可能性があるので取り直す
+                target = frameIndex + 1;
+
+                ManagedFrame? next = null;
+                await WithProducerPausedAsync(() =>
+                {
+                    next = DequeueFrameAtLeast(target);
+                    return Task.CompletedTask;
+                });
+
+                if (next != null)
+                {
+                    if (!PresentSingleFrame(next, target)) return false;
+
+                    // 音声位置は動かしていないので、再開時にまとめて合わせる
+                    needsAudioResync = true;
+                    Log($"[Step] コマ送り → frameIndex={frameIndex}");
+                    return true;
+                }
+
+                needSeek = true;
+            }
+            finally
+            {
+                seekLock.Release();
+            }
+
+            // バッファに無かった場合はシークで取りに行く（音声もここで同期される）。
+            // SeekToExactFrameAsync も seekLock を取るため、必ず解放してから呼ぶこと。
+            if (needSeek)
+            {
+                Log($"[Step] バッファに {target} が無いためシークします。");
+                return await SeekToExactFrameAsync(target);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// アクティブなキューから Index が minIndex 以上のフレームを 1 枚取り出す。
+        /// それより古いフレームは破棄する。見つからなければ null。
+        /// </summary>
+        private ManagedFrame? DequeueFrameAtLeast(long minIndex)
+        {
+            while (true)
+            {
+                var f = DequeueForTarget();
+                if (f == null) return null;
+
+                // Index 不明(-1)のフレームはそのまま採用する
+                if (f.Index >= 0 && f.Index < minIndex) { f.Dispose(); continue; }
+                return f;
+            }
+        }
+
+        /// <summary>
+        /// フレームを 1 枚だけ UI に提示し、frameIndex を更新する。
+        /// フレームは提示処理側で解放されるため、呼び出し後に参照してはならない。
+        /// </summary>
+        private bool PresentSingleFrame(ManagedFrame frame, long fallbackIndex)
+        {
+            unsafe
+            {
+                if (frame.Frame == null) { frame.Dispose(); return false; }
+
+                // CPU ターゲットなら CPU フレーム化してから渡す
+                if (IsCpuTarget && frame.IsGpuFrame)
+                {
+                    frame.GetCpuFrame();
+                    if (frame.Frame == null) { frame.Dispose(); return false; }
+                }
+            }
+
+            long idx = frame.Index;
+            EnqueueForUi(frame);   // ここでフレームは解放される
+            frameIndex = (int)(idx < 0 ? fallbackIndex : idx);
+            return true;
         }
 
         // ----------------------------------
