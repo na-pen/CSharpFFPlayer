@@ -19,6 +19,7 @@ namespace CSharpFFPlayer
         public const int AVERROR_EOF = -541478725;      // End of File
         public const int AVERROR_EINVAL = -22;             // 無効な引数
         public const int AVERROR_EIO = -5;              // I/O エラー
+        public const int AVERROR_INVALIDDATA = -1094995529; // 入力データが不正（ビットストリームの不連続など）
     }
 
     public enum FrameReadResult
@@ -358,6 +359,13 @@ namespace CSharpFFPlayer
         private readonly Queue<AVPacketPtr> videoPackets = new();
         private readonly Queue<AVPacketPtr> audioPackets = new();
 
+        /// <summary>1 回の SendPacket 呼び出しで読み飛ばす不正パケットの上限。</summary>
+        private const int MAX_SKIPPED_PACKETS = 200;
+
+        /// <summary>
+        /// 指定ストリームのパケットをデコーダへ送る。
+        /// 戻り値: 0=送信した / -1=EOF・読み取り失敗 / -2=送信できなかった（再試行可）
+        /// </summary>
         public int SendPacket(int streamIndex)
         {
             lock (sendPackedSyncObject)
@@ -371,11 +379,16 @@ namespace CSharpFFPlayer
                 {
                     int sret = ffmpeg.avcodec_send_packet(ctx, queued.Ptr);
                     queued.Dispose();
+
+                    if (sret == 0) return 0;
+                    if (IsRecoverableSendError(sret, "queued")) return -2;
+
                     ThrowIfErr(sret, "avcodec_send_packet(queued)");
                     return 0;
                 }
 
                 // 読み進めて該当ストリームのパケットを送る
+                int skipped = 0;
                 while (true)
                 {
                     AVPacket pkt = new AVPacket();
@@ -394,6 +407,21 @@ namespace CSharpFFPlayer
                             if (isTarget)
                             {
                                 int sret = ffmpeg.avcodec_send_packet(c, &pkt);
+                                if (sret == 0) return 0;
+
+                                // 不正データはこのパケットを捨てて次を読む。
+                                // 次のキーフレームでデコーダが復帰するため、
+                                // ここで例外を投げると再生が完全に止まってしまう。
+                                if (IsRecoverableSendError(sret, isTarget ? "target" : "other"))
+                                {
+                                    if (++skipped >= MAX_SKIPPED_PACKETS)
+                                    {
+                                        LogWarn($"不正パケットを {skipped} 個連続で読み飛ばしました。いったん中断します。");
+                                        return -2;
+                                    }
+                                    continue;
+                                }
+
                                 ThrowIfErr(sret, "avcodec_send_packet(target)");
                                 return 0;
                             }
@@ -410,6 +438,29 @@ namespace CSharpFFPlayer
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// avcodec_send_packet の戻り値が「致命的でない」ものかを判定する。
+        /// シーク直後などビットストリームが不連続になった場合に発生する。
+        /// </summary>
+        private static bool IsRecoverableSendError(int err, string where)
+        {
+            if (err == FFmpegErrors.AVERROR_INVALIDDATA)
+            {
+                LogWarn($"avcodec_send_packet({where}): 不正データのためパケットを読み飛ばします。");
+                return true;
+            }
+
+            // 出力キューが埋まっている状態。receive_frame が EAGAIN を返した直後にしか
+            // SendPacket を呼ばないため通常は発生しないが、落とさずに再試行させる。
+            if (err == FFmpegErrors.AVERROR_EAGAIN)
+            {
+                LogWarn($"avcodec_send_packet({where}): デコーダが受け付けられませんでした。再試行します。");
+                return true;
+            }
+
+            return false;
         }
 
 

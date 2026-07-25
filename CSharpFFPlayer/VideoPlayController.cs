@@ -81,6 +81,7 @@ namespace CSharpFFPlayer
         private const int NO_FRAME_WAIT_MS = 2;          // 提示できるフレームが無いときの待機
         private const int LATE_RESYNC_FRAMES = 3;        // この枚数以上遅れたら理想時刻を再同期
         private const int DRAW_LOOP_PARK_MS = 10;        // 描画ループが停止するまでの余裕
+        private const int PRODUCER_MAX_CONSECUTIVE_ERRORS = 50;  // これ以上連続で失敗したら諦める
 
         /// <summary>
         /// フレーム毎の [Draw] ログを出すか。
@@ -1005,6 +1006,8 @@ namespace CSharpFFPlayer
         {
             try
             {
+                int consecutiveErrors = 0;
+
                 while (playbackState != PlaybackState.Stopped)
                 {
                     if (producerPaused)
@@ -1014,30 +1017,45 @@ namespace CSharpFFPlayer
                         continue;
                     }
 
-                    if (gpuFrames.Count >= GPU_FRAME_TARGET) { await Task.Delay(1); continue; }
-
-                    var frame = await TryReadNextFrameAsync(seekPrefetchEndFrameIndex >= 0 ? seekPrefetchEndFrameIndex : null);
-                    if (frame == null) { await Task.Delay(1); continue; }
-
-                    if (seekPrefetchEndFrameIndex >= 0 && frame.Index < seekPrefetchEndFrameIndex)
+                    // 1 回のデコード失敗でループごと落とさない。
+                    // ここで抜けるとフレーム供給が二度と再開せず、再生が完全に停止する。
+                    try
                     {
-                        frame.Dispose();
-                        continue;
-                    }
+                        if (gpuFrames.Count >= GPU_FRAME_TARGET) { await Task.Delay(1); continue; }
 
-                    // 重複防止
-                    if (Interlocked.Read(ref lastEnqueuedFrameIndex) == frame.Index)
+                        var frame = await TryReadNextFrameAsync(seekPrefetchEndFrameIndex >= 0 ? seekPrefetchEndFrameIndex : null);
+                        if (frame == null) { await Task.Delay(1); continue; }
+
+                        if (seekPrefetchEndFrameIndex >= 0 && frame.Index < seekPrefetchEndFrameIndex)
+                        {
+                            frame.Dispose();
+                            continue;
+                        }
+
+                        // 重複防止
+                        if (Interlocked.Read(ref lastEnqueuedFrameIndex) == frame.Index)
+                        {
+                            frame.Dispose();
+                            continue;
+                        }
+
+                        gpuFrames.Enqueue(frame);
+                        Interlocked.Exchange(ref lastEnqueuedFrameIndex, frame.Index);
+                        consecutiveErrors = 0;
+                    }
+                    catch (Exception ex)
                     {
-                        frame.Dispose();
-                        continue;
+                        Err($"[Producer] デコードに失敗しました（継続します）: {ex.Message}");
+
+                        if (++consecutiveErrors >= PRODUCER_MAX_CONSECUTIVE_ERRORS)
+                        {
+                            Err($"[Producer] {consecutiveErrors} 回連続で失敗したため停止します。");
+                            SetState(PlaybackState.Stopped, "Producer error");
+                            break;
+                        }
+
+                        await Task.Delay(10);
                     }
-
-                    gpuFrames.Enqueue(frame);
-                    Interlocked.Exchange(ref lastEnqueuedFrameIndex, frame.Index);
-
-#if DEBUG
-                    //Log($"[Producer] Enqueue GPU idx={frame.Index} (GPU={gpuFrames.Count})");
-#endif
                 }
             }
             catch (Exception e)
@@ -1059,26 +1077,33 @@ namespace CSharpFFPlayer
             {
                 while (playbackState != PlaybackState.Stopped)
                 {
-                    if (isSeeking || !IsCpuTarget) { await Task.Delay(30); continue; }
-
-                    while (cpuFrames.Count < CPU_FRAME_TARGET && gpuFrames.TryDequeue(out var g))
+                    // ここで抜けると CPU 描画時にフレーム供給が止まったまま無音で壊れるため、
+                    // 1 回の失敗ではループを終わらせない。
+                    try
                     {
-                        try
-                        {
-                            if (g.IsGpuFrame) unsafe { g.GetCpuFrame(); }
-                            cpuFrames.Enqueue(g);
-#if DEBUG
-                            //Log($"[Transfer] GPU→CPU idx={g.Index} (CPU={cpuFrames.Count})");
-#endif
-                        }
-                        catch (Exception ex)
-                        {
-                            Err($"[GPU→CPU] {ex.Message}");
-                            g.Dispose();
-                        }
-                    }
+                        if (isSeeking || !IsCpuTarget) { await Task.Delay(30); continue; }
 
-                    await Task.Delay(1);
+                        while (cpuFrames.Count < CPU_FRAME_TARGET && gpuFrames.TryDequeue(out var g))
+                        {
+                            try
+                            {
+                                if (g.IsGpuFrame) unsafe { g.GetCpuFrame(); }
+                                cpuFrames.Enqueue(g);
+                            }
+                            catch (Exception ex)
+                            {
+                                Err($"[GPU→CPU] {ex.Message}");
+                                g.Dispose();
+                            }
+                        }
+
+                        await Task.Delay(1);
+                    }
+                    catch (Exception ex)
+                    {
+                        Err($"[GPU→CPU] ループ内で失敗しました（継続します）: {ex.Message}");
+                        await Task.Delay(10);
+                    }
                 }
             }
             catch (Exception e)
