@@ -23,6 +23,7 @@ namespace CSharpFFPlayer
         private int _dstWidth;
         private int _dstHeight;
         private int _dstStride; // WPF の BackBufferStride を渡す。0 の場合は幅×Bpp を自動使用。
+        private int _dstBpp;    // Configure 時に確定（フレーム毎の av_pix_fmt_desc_get 呼び出しを避ける）
 
         private SwsContext* _sws; // libswscale コンテキスト
 
@@ -68,6 +69,7 @@ namespace CSharpFFPlayer
             _dstWidth = dstWidth;
             _dstHeight = dstHeight;
             _dstFormat = dstFormat;
+            _dstBpp = BytesPerPixel(dstFormat);
 
             RecreateOrCacheSws();
             Log($"[Configure] src={_srcWidth}x{_srcHeight}/{_srcFormat} -> dst={_dstWidth}x{_dstHeight}/{_dstFormat}");
@@ -98,8 +100,7 @@ namespace CSharpFFPlayer
             EnsureSourceFrom(frame);
 
             // 出力バッファの行ストライド（未指定なら幅×Bpp）
-            int bpp = BytesPerPixel(_dstFormat);
-            int dstStrideUse = _dstStride > 0 ? _dstStride : _dstWidth * bpp;
+            int dstStrideUse = _dstStride > 0 ? _dstStride : _dstWidth * _dstBpp;
 
             // 出力プレーンを1面だけ使う（BGRA/ARGB などパックドを想定）
             byte_ptrArray4 dstData = default;
@@ -151,6 +152,46 @@ namespace CSharpFFPlayer
         }
 
         /// <summary>
+        /// 「幅×Bpp」ピッチで 1 フレーム分を保持するのに必要なバイト数。
+        /// </summary>
+        public int DestinationBufferSize => _dstWidth * _dstBpp * _dstHeight;
+
+        /// <summary>
+        /// 呼び出し側が用意したバッファへ変換する（配列を新規確保しない）。
+        /// 出力は「幅×Bpp」ピッチの連続データ。
+        /// </summary>
+        public void ConvertFrameToBuffer(ManagedFrame frame, byte[] destination)
+        {
+            if (frame is null) throw new ArgumentNullException(nameof(frame));
+            if (destination is null) throw new ArgumentNullException(nameof(destination));
+
+            GuardConfigured();
+
+            int stride = _dstWidth * _dstBpp;
+            int size = stride * _dstHeight;
+            if (destination.Length < size)
+                throw new ArgumentException($"バッファが小さすぎます: {destination.Length} < {size}", nameof(destination));
+
+            // HW フレームなら CPU 化してから渡す
+            frame.GetCpuFrame();
+
+            fixed (byte* p = destination)
+            {
+                // 一時的に出力ストライドを「幅×Bpp」に固定して Direct に流用
+                int old = _dstStride;
+                _dstStride = stride;
+                try
+                {
+                    ConvertFrameDirect(frame.Frame, p);
+                }
+                finally
+                {
+                    _dstStride = old;
+                }
+            }
+        }
+
+        /// <summary>
         /// 再利用配列( ArrayPool )を使って変換先を書き込みたい場合のオーバーロード。
         /// 戻り値：実際に使用した配列（呼び出し側で ArrayPool に返却すること）。
         /// </summary>
@@ -161,8 +202,7 @@ namespace CSharpFFPlayer
 
             frame.GetCpuFrame(); // 必要なら CPU 化（方針に応じて外しても良い）
 
-            int bpp = BytesPerPixel(_dstFormat);
-            int stride = _dstWidth * bpp;        // 配列版は「幅×Bpp」ピッチで作る
+            int stride = _dstWidth * _dstBpp;    // 配列版は「幅×Bpp」ピッチで作る
             int size = stride * _dstHeight;
 
             var buffer = pool.Rent(size);
@@ -254,8 +294,7 @@ namespace CSharpFFPlayer
             if (frame == null) throw new ArgumentNullException(nameof(frame));
 
             // 出力は「幅×Bpp」ピッチの連続配列として確保
-            int bpp = BytesPerPixel(_dstFormat);
-            int stride = _dstWidth * bpp;
+            int stride = _dstWidth * _dstBpp;
             int size = stride * _dstHeight;
 
             var buffer = new byte[size];

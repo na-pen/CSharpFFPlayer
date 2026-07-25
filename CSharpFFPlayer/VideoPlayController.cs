@@ -954,9 +954,11 @@ namespace CSharpFFPlayer
                 }
                 else
                 {
-                    // D3DImage では BGRA を渡して表示
+                    // D3DImage では BGRA を渡して表示。
+                    // バッファはプールから借りたものなので、表示側が使い終わったら返却する
+                    // （返却されるまで次のフレームがこのバッファを再利用することはない）。
                     byte[] bgra = decoder.GetBgraFrame(frame, frameConveter, bt709: true);
-                    imageWriter.PresentBgra(bgra);
+                    imageWriter.PresentBgra(bgra, decoder.ReturnBgraBuffer);
                     // ManagedFrame は UnifiedImageWriter 側に渡さないので、ここで解放
                     frame.Dispose();
                 }

@@ -3,11 +3,13 @@ using ManagedCuda;
 using ManagedCuda.BasicTypes;
 using ManagedCuda.VectorTypes;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Management;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace CSharpFFPlayer
 {
@@ -575,7 +577,54 @@ namespace CSharpFFPlayer
         private int _cachedBufSize;
         private dim3 _cachedBlock;
         private dim3 _cachedGrid;
-        private byte[] _hostBuffer;
+
+        // ==== BGRA ホストバッファのプール ====
+        // 1920x1080 なら 1 枚 8MB。毎フレーム確保すると LOH を圧迫するため使い回す。
+        // 単一の共有バッファにすると、描画待ち(Dispatcher)のバッファを次のフレームが
+        // 上書きしてしまうので、表示側が使い終わったものを ReturnBgraBuffer() で戻す。
+        // 借用/返却は描画スレッドと UI スレッドの双方から起きるためロックフリーな
+        // ConcurrentBag を使う（呼び出し側は描画差し替えロックを保持していることがある）。
+        private const int BGRA_POOL_MAX = 4;
+
+        private readonly ConcurrentBag<byte[]> _bgraPool = new();
+        private int _bgraPoolCount;      // ConcurrentBag.Count は内部ロックを取るため自前で数える
+        private int _bgraBufferSize = -1;
+
+        /// <summary>BGRA 1 フレーム分のバッファを借りる。</summary>
+        private byte[] RentBgraBuffer(int size)
+        {
+            if (size != _bgraBufferSize)
+            {
+                // 解像度や出力形式が変わったら古いサイズのバッファは捨てる
+                _bgraPool.Clear();
+                Interlocked.Exchange(ref _bgraPoolCount, 0);
+                _bgraBufferSize = size;
+            }
+
+            if (_bgraPool.TryTake(out var buffer))
+            {
+                Interlocked.Decrement(ref _bgraPoolCount);
+                return buffer;
+            }
+            return new byte[size];
+        }
+
+        /// <summary>
+        /// GetBgraFrame() が返したバッファを返却する。
+        /// 表示側が使い終わったタイミングで呼ぶこと（呼ばなくても GC されるだけ）。
+        /// </summary>
+        public void ReturnBgraBuffer(byte[] buffer)
+        {
+            if (buffer == null || buffer.Length != _bgraBufferSize) return;
+
+            // 際限なく溜め込まない
+            if (Interlocked.Increment(ref _bgraPoolCount) > BGRA_POOL_MAX)
+            {
+                Interlocked.Decrement(ref _bgraPoolCount);
+                return;
+            }
+            _bgraPool.Add(buffer);
+        }
 
         private void EnsureCachedParams(int w, int h)
         {
@@ -594,9 +643,6 @@ namespace CSharpFFPlayer
             // デバイス側バッファ確保
             _decOutBgra?.Dispose();
             _decOutBgra = new CudaDeviceVariable<byte>(_cachedBufSize);
-
-            // ホスト側バッファ確保
-            _hostBuffer = new byte[_cachedBufSize];
 
             Log($"CUDA: setup for {w}x{h}, buf={_cachedBufSize} bytes");
         }
@@ -623,14 +669,17 @@ namespace CSharpFFPlayer
             );
             _decCudaCtx.Synchronize();
 
-            _decOutBgra.CopyToHost(_hostBuffer);
-            return _hostBuffer;
+            // CopyToHost はデバイス側のサイズ分をコピーするため、ぴったりのサイズで借りる
+            byte[] host = RentBgraBuffer(_cachedBufSize);
+            _decOutBgra.CopyToHost(host);
+            return host;
         }
 
 
 
         /// <summary>
         /// CUDA ハードウェアフレーム(NV12)→BGRA。CPU フレームは conv にフォールバック。
+        /// 戻り値はプールから借りたバッファ。表示が終わったら ReturnBgraBuffer() で返すこと。
         /// </summary>
         public unsafe byte[] GetBgraFrame(ManagedFrame managed, FrameConveter conv, bool bt709 = true)
         {
@@ -643,7 +692,12 @@ namespace CSharpFFPlayer
             {
                 return ConvertCudaNV12FrameToBgra_OnDecodeThread(f, bt709);
             }
-            return conv.ConvertFrameToArray(managed);
+
+            // CUDA 以外（QSV/AMF/ソフトウェアデコード）の経路。
+            // 以前はフレーム毎に byte[] を新規確保していたためプールから借りる。
+            byte[] host = RentBgraBuffer(conv.DestinationBufferSize);
+            conv.ConvertFrameToBuffer(managed, host);
+            return host;
         }
 
         // ====================== AVPacket holder ======================
@@ -674,6 +728,10 @@ namespace CSharpFFPlayer
         private void DisposeUnManaged()
         {
             if (isDisposed) return;
+
+            // BGRA バッファプールを解放
+            _bgraPool.Clear();
+            Interlocked.Exchange(ref _bgraPoolCount, 0);
 
             // CUDA
             try

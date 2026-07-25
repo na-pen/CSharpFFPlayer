@@ -225,8 +225,30 @@ namespace CSharpFFPlayer
 
                     // sysmem → shared surface → D3DImage
                     var lr = sysmemTex!.LockRectangle(0, LockFlags.Discard);
-                    Marshal.Copy(current, 0, lr.DataPointer, current.Length);
-                    sysmemTex.UnlockRectangle(0);
+                    try
+                    {
+                        // コピー量は「配列長」ではなく必要なバイト数で決める。
+                        // また、テクスチャの行ピッチが幅×4 と一致しない場合があるため行単位でコピーする。
+                        int srcStride = width * 4;
+                        int dstStride = lr.Pitch;
+                        int rows = Math.Min(height, current.Length / srcStride);
+
+                        if (dstStride == srcStride)
+                        {
+                            Marshal.Copy(current, 0, lr.DataPointer, srcStride * rows);
+                        }
+                        else
+                        {
+                            for (int y = 0; y < rows; y++)
+                            {
+                                Marshal.Copy(current, y * srcStride, lr.DataPointer + y * dstStride, srcStride);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        sysmemTex.UnlockRectangle(0);
+                    }
 
                     device!.UpdateSurface(sysmemSurf!, null, d3d9SharedSurf!, null);
 
