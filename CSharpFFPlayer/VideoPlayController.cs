@@ -83,12 +83,18 @@ namespace CSharpFFPlayer
         private const int DRAW_LOOP_PARK_MS = 10;        // 描画ループが停止するまでの余裕
         private const int PRODUCER_MAX_CONSECUTIVE_ERRORS = 50;  // これ以上連続で失敗したら諦める
 
+        // 音声とのズレを 1 フレームでどれだけ詰めるか（0〜1）。
+        // 1.0（＝ズレを一気に全部詰める）にすると、待ちすぎ→待たなすぎ を
+        // 1 フレームおきに繰り返す発振に陥るため、少しずつ詰める。
+        private const double AV_SYNC_GAIN = 0.15;
+        private const double AV_SYNC_MAX_CORRECTION_RATIO = 0.5;  // 1 フレームあたりの補正上限（フレーム長比）
+
         /// <summary>
-        /// フレーム毎の [Draw] ログを出すか。
-        /// ペーシングの検証用。Console 出力は描画ループ上では重いため、
-        /// 確認が済んだら false にしてよい。
+        /// フレーム毎の [Draw] ログを出すか（既定 false）。
+        /// 60fps では毎秒 60 回の Console 出力が描画タイミングそのものを乱すため、
+        /// ペーシングを調べたいときだけ true にすること。
         /// </summary>
-        public bool VerboseDrawLog { get; set; } = true;
+        public bool VerboseDrawLog { get; set; } = false;
 
         // --- 状態 ---
         private PlaybackState playbackState = PlaybackState.Stopped;
@@ -881,13 +887,12 @@ namespace CSharpFFPlayer
                     // 音声に対する映像のズレ(ms)。正なら映像が遅れている。
                     double offset = inFrame2.TotalMilliseconds + diff * baseFrameDurationMs;
 
-                    // 理想時刻は 1 フレーム分だけ進める。
-                    // offset はこの後の待ち時間にのみ効かせる（両方に適用すると補正が二重になり発振する）。
+                    // 理想時刻を 1 フレーム分進める
                     nextPresentMs += baseFrameDurationMs;
 
                     long nowTicks = sw.ElapsedTicks;
                     double nowMs = nowTicks * tickToMs;
-                    double err = nowMs - nextPresentMs;   // 正なら理想時刻より遅れている
+                    double err = nowMs - nextPresentMs;   // 正なら理想時刻より遅れている（補正前で判定する）
 
                     // 大きく遅れた場合は理想時刻を現在に引き戻す（遅れ分の一括追いつきを防ぐ）
                     if (err > baseFrameDurationMs * LATE_RESYNC_FRAMES)
@@ -897,13 +902,25 @@ namespace CSharpFFPlayer
                         err = 0;
                     }
 
-                    double waitMs = (nextPresentMs - nowMs) - offset;
+                    // 音声とのズレは「理想時刻そのもの」に反映する。
+                    // 待ち時間だけに効かせると、理想時刻は常に一定間隔で進むのに
+                    // 実際の提示時刻だけがずれるため両者が噛み合わず、
+                    // 「長く待つ → 遅れたと判断して即提示 → また進みすぎる」を繰り返して発振する。
+                    // さらに一度に全部詰めず AV_SYNC_GAIN の割合だけ詰める。
+                    double maxCorrection = baseFrameDurationMs * AV_SYNC_MAX_CORRECTION_RATIO;
+                    double correction = Math.Clamp(offset * AV_SYNC_GAIN, -maxCorrection, maxCorrection);
+
+                    // offset が負（映像が音声より先行）なら correction も負。
+                    // 引くことで理想時刻が後ろにずれ、待ち時間が伸びる。
+                    nextPresentMs -= correction;
+
+                    double waitMs = nextPresentMs - nowMs;
 
                     double usedMs = (nowTicks - lastTicks) * tickToMs;
                     lastTicks = nowTicks;
 
                     if (VerboseDrawLog)
-                        Console.WriteLine($"[Draw] idx={frameIndex} used={usedMs:F2}ms wait={waitMs:F2}ms err={err:F2}ms offset={offset:F2}ms");
+                        Console.WriteLine($"[Draw] idx={frameIndex} used={usedMs:F2}ms wait={waitMs:F2}ms err={err:F2}ms offset={offset:F2}ms corr={correction:F2}ms");
 
                     if (waitMs > 0)
                         await Task.Delay((int)Math.Round(waitMs));
