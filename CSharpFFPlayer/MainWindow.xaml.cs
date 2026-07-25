@@ -21,6 +21,9 @@ namespace CSharpFFPlayer
         private bool isDraggingSlider = false;   // ユーザーがスライダーを操作中かどうか
         private bool isUpdatingSlider = false;   // スライダー更新ループ制御
 
+        // 描画方式（メニューから切り替え可能。既定は D3D 経路）
+        private RenderTargetType _renderTargetType = RenderTargetType.D3DImage;
+
         public event PropertyChangedEventHandler? PropertyChanged;
 
         private string _currentTimeDisplay = "00:00";
@@ -57,6 +60,66 @@ namespace CSharpFFPlayer
         public MainWindow()
         {
             InitializeComponent();
+            UpdateRenderTargetMenu();
+        }
+
+        /// <summary>
+        /// 描画方式メニューのチェック状態を現在の設定に同期する
+        /// </summary>
+        private void UpdateRenderTargetMenu()
+        {
+            MenuRenderWriteableBitmap.IsChecked = _renderTargetType == RenderTargetType.WriteableBitmap;
+            MenuRenderD3DImage.IsChecked = _renderTargetType == RenderTargetType.D3DImage;
+        }
+
+        /// <summary>
+        /// メニューから描画方式（通常 / D3D）を切り替える
+        /// </summary>
+        private async void RenderTarget_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is not MenuItem item || item.Tag is not string tag) return;
+            if (!Enum.TryParse<RenderTargetType>(tag, out var target)) return;
+
+            // 選択中の項目を再クリックした場合はチェック状態だけ戻す
+            if (target == _renderTargetType)
+            {
+                UpdateRenderTargetMenu();
+                return;
+            }
+
+            _renderTargetType = target;
+            UpdateRenderTargetMenu();
+
+            // 未読み込み／停止中は次回のファイル読み込み時に反映する
+            if (_videoPlayController == null || !_videoPlayController.CanSwitchRenderTarget)
+            {
+                Console.WriteLine($"[描画切替] 次回のファイル読み込み時に {target} を適用します。");
+                return;
+            }
+
+            ShowLoading(true);
+            try
+            {
+                await _videoPlayController.SwitchRenderTargetAsync(target, src =>
+                {
+                    _imageSource = src;
+                    VideoImage.Source = src;
+                });
+                Console.WriteLine($"[描画切替] {target} に切り替えました。");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"描画方式の切り替えに失敗しました: {ex.Message}", "エラー", MessageBoxButton.OK, MessageBoxImage.Warning);
+                Console.WriteLine($"[エラー] 描画切替: {ex}");
+
+                // 実際の状態に合わせてメニュー表示を戻す
+                _renderTargetType = _videoPlayController.CurrentRenderTarget;
+                UpdateRenderTargetMenu();
+            }
+            finally
+            {
+                ShowLoading(false);
+            }
         }
 
         private void ShowLoading(bool isVisible) =>
@@ -128,8 +191,8 @@ namespace CSharpFFPlayer
             int dpiX = (int)Math.Round(96 / matrix.M11);
             int dpiY = (int)Math.Round(96 / matrix.M22);
 
-            // Bitmap生成（GPU/DX経由も対応）
-            _imageSource = await _videoPlayController.CreateBitmapAsync(dpiX, dpiY, RenderTargetType.WriteableBitmap);
+            // Bitmap生成（GPU/DX経由も対応）。描画方式はメニューの選択に従う。
+            _imageSource = await _videoPlayController.CreateBitmapAsync(dpiX, dpiY, _renderTargetType);
             VideoImage.Source = _imageSource;
 
             // 再生時間表示更新

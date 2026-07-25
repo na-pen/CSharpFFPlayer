@@ -33,7 +33,36 @@ namespace CSharpFFPlayer
     public class VideoPlayController
     {
         // --- 表示ターゲット ---
-        private RenderTargetType targetType;
+        // 描画ループ / Producer / 転送ループから読まれるため volatile
+        private volatile RenderTargetType targetType;
+
+        /// <summary>現在の描画ターゲット。</summary>
+        public RenderTargetType CurrentRenderTarget => targetType;
+
+        /// <summary>
+        /// 今この場で描画ターゲットを切り替えられるか。
+        /// 停止中は decoder が破棄済み、再生終了後は PlayInternal が抜けており
+        /// 切り替えても再生を再開できないため、いずれも不可とする。
+        /// </summary>
+        public bool CanSwitchRenderTarget =>
+            decoder != null && imageWriter != null &&
+            playbackState is PlaybackState.Playing or PlaybackState.Paused or PlaybackState.Buffering;
+
+        // 描画ターゲット差し替えと「UI への提示」を相互排他にするゲート。
+        // ※この lock の内側では絶対に await しない（UI スレッドとのデッドロック回避）。
+        // ※Stop() による decoder 破棄はこのゲートでは守られない。
+        //   切り替えは Playing/Paused/Buffering のみ許可することで回避している。
+        private readonly object renderSwapGate = new();
+
+        // 切り替えの二重実行防止
+        private int switchingRenderTarget = 0;
+
+        // 描画ターゲット再構築のためにキャッシュしておく情報
+        private int frameWidth;
+        private int frameHeight;
+        private AVPixelFormat srcPixFmt = AVPixelFormat.AV_PIX_FMT_NONE;
+        private int bitmapDpiX = 96;
+        private int bitmapDpiY = 96;
 
         // FFmpeg ピクセルフォーマット（CPU表示/BGR24, D3D表示/BGRA）
         private static readonly AVPixelFormat CpuFfPixFmt = AVPixelFormat.AV_PIX_FMT_BGR24;
@@ -59,8 +88,8 @@ namespace CSharpFFPlayer
 
         // --- デコーダ/描画 ---
         private Decoder decoder;
-        private UnifiedImageWriter imageWriter;
-        private FrameConveter frameConveter;
+        private UnifiedImageWriter? imageWriter;
+        private FrameConveter? frameConveter;
 
         // --- FPS/タイミング ---
         private AVRational rawFps;
@@ -205,37 +234,144 @@ namespace CSharpFFPlayer
             {
                 if (managedFrame.Frame == null) throw new InvalidOperationException("CPU 転送後のフレームが null");
 
-                int w = managedFrame.Frame->width;
-                int h = managedFrame.Frame->height;
-                var srcFmt = (AVPixelFormat)managedFrame.Frame->format;
+                // 描画ターゲット再構築のために保持しておく
+                frameWidth = managedFrame.Frame->width;
+                frameHeight = managedFrame.Frame->height;
+                srcPixFmt = (AVPixelFormat)managedFrame.Frame->format;
+                bitmapDpiX = dpiX;
+                bitmapDpiY = dpiY;
+            }
 
-                frameConveter = new FrameConveter();
+            var (source, writer, conveter) = CreateRenderTargetCore(targetType, dpiX, dpiY);
+            frameConveter = conveter;
+            imageWriter = writer;
 
-                if (IsCpuTarget)
+            managedFrame.Index = GetFrameIndex(managedFrame) ?? -1;
+            if (IsCpuTarget)
+            {
+                // 初回フレームを投げて UI 側へ
+                imageWriter.EnqueueFrame(managedFrame);
+                cpuFrames.Enqueue(managedFrame);
+            }
+            else
+            {
+                // 初回フレームは GPU キューで扱う
+                gpuFrames.Enqueue(managedFrame);
+            }
+
+            return source;
+        }
+
+        // ----------------------------------
+        // 内部：描画ターゲット一式（変換器 + ImageSource + Writer）の生成
+        // ----------------------------------
+        private (ImageSource source, UnifiedImageWriter writer, FrameConveter conveter)
+            CreateRenderTargetCore(RenderTargetType type, int dpiX, int dpiY)
+        {
+            if (frameWidth <= 0 || frameHeight <= 0 || srcPixFmt == AVPixelFormat.AV_PIX_FMT_NONE)
+                throw new InvalidOperationException("フレーム情報が未取得です。CreateBitmapAsync を先に呼んでください。");
+
+            // FrameConveter は使い回さず毎回新規に作る
+            // （WriteableBitmap 経路で設定された dstStride が BGRA 経路に持ち越されるのを防ぐ）
+            var conveter = new FrameConveter();
+
+            if (type == RenderTargetType.WriteableBitmap)
+            {
+                // CPU(BGR24) で描画
+                conveter.Configure(frameWidth, frameHeight, srcPixFmt, frameWidth, frameHeight, CpuFfPixFmt);
+                var wb = new WriteableBitmap(frameWidth, frameHeight, dpiX, dpiY, WpfPixFmt, null);
+                var writer = new UnifiedImageWriter(RenderTargetType.WriteableBitmap, frameWidth, frameHeight, conveter, wb);
+                Log($"CreateRenderTarget: WriteableBitmap {frameWidth}x{frameHeight}");
+                return (wb, writer, conveter);
+            }
+            else
+            {
+                // D3DImage(BGRA) で描画
+                conveter.Configure(frameWidth, frameHeight, srcPixFmt, frameWidth, frameHeight, D3dFfPixFmt);
+                var di = new D3DImage();
+                var writer = new UnifiedImageWriter(RenderTargetType.D3DImage, frameWidth, frameHeight, conveter, di: di);
+                Log($"CreateRenderTarget: D3DImage {frameWidth}x{frameHeight}");
+                return (di, writer, conveter);
+            }
+        }
+
+        // ----------------------------------
+        // 公開：描画ターゲット（通常 / D3D）の切り替え
+        // ----------------------------------
+        /// <summary>
+        /// 再生中／一時停止中に描画経路を切り替える。
+        /// 新しい ImageSource は <paramref name="attach"/> 経由で UI に渡す
+        /// （旧 Writer を破棄する前に差し替える必要があるため）。
+        /// </summary>
+        /// <returns>切り替えを行った場合 true。既に同じターゲットなら false。</returns>
+        public async Task<bool> SwitchRenderTargetAsync(RenderTargetType newTarget, Action<ImageSource> attach)
+        {
+            ArgumentNullException.ThrowIfNull(attach);
+
+            if (decoder == null || imageWriter == null)
+                throw new InvalidOperationException("CreateBitmapAsync 後に呼び出してください。");
+
+            // Stop() 済みだと decoder が破棄されているため切り替え不可
+            if (playbackState == PlaybackState.Stopped)
+                throw new InvalidOperationException("停止中は描画ターゲットを切り替えられません。");
+
+            if (targetType == newTarget) return false;
+
+            if (Interlocked.CompareExchange(ref switchingRenderTarget, 1, 0) != 0)
+            {
+                Warn("[Switch] 二重実行は無視されました。");
+                return false;
+            }
+
+            try
+            {
+                bool wasPlaying = IsPlaying;
+                Pause();
+
+                long resumeFrameIndex = frameIndex;
+                Log($"[Switch] {targetType} -> {newTarget} (frameIndex={resumeFrameIndex}, wasPlaying={wasPlaying})");
+
+                UnifiedImageWriter? oldWriter = null;
+                FrameConveter? oldConveter = null;
+
+                await WithProducerPausedAsync(() =>
                 {
-                    // CPU(BGR24) で描画
-                    frameConveter.Configure(w, h, srcFmt, w, h, CpuFfPixFmt);
-                    var wb = new WriteableBitmap(w, h, dpiX, dpiY, WpfPixFmt, null);
-                    imageWriter = new UnifiedImageWriter(RenderTargetType.WriteableBitmap, w, h, frameConveter, wb);
-                    Log($"CreateBitmap: WriteableBitmap {w}x{h}");
-                    // 初回フレームを投げて UI 側へ
-                    managedFrame.Index = GetFrameIndex(managedFrame) ?? -1;
-                    imageWriter.EnqueueFrame(managedFrame);
-                    cpuFrames.Enqueue(managedFrame);
-                    return wb;
-                }
-                else
-                {
-                    // D3DImage(BGRA) で描画
-                    frameConveter.Configure(w, h, srcFmt, w, h, D3dFfPixFmt);
-                    var di = new D3DImage();
-                    imageWriter = new UnifiedImageWriter(RenderTargetType.D3DImage, w, h, frameConveter, di: di);
-                    Log($"CreateBitmap: D3DImage {w}x{h}");
-                    // 初回フレームは GPU キューで扱う
-                    managedFrame.Index = GetFrameIndex(managedFrame) ?? -1;
-                    gpuFrames.Enqueue(managedFrame);
-                    return di;
-                }
+                    FlushQueues();
+                    Interlocked.Exchange(ref lastEnqueuedFrameIndex, -1);
+
+                    // 先に新しい一式を作ってから差し替える
+                    var (source, writer, conveter) = CreateRenderTargetCore(newTarget, bitmapDpiX, bitmapDpiY);
+
+                    lock (renderSwapGate)
+                    {
+                        oldWriter = imageWriter;
+                        oldConveter = frameConveter;
+
+                        imageWriter = writer;
+                        frameConveter = conveter;
+                        targetType = newTarget;
+                    }
+
+                    // UI の Image.Source を新しいものに差し替えてから旧リソースを破棄する
+                    attach(source);
+
+                    return Task.CompletedTask;
+                });
+
+                oldWriter?.Dispose();
+                oldConveter?.Dispose();
+
+                // 元の位置へ戻してバッファを作り直す
+                await SeekToExactFrameAsync(resumeFrameIndex);
+
+                if (wasPlaying) await Play();
+
+                Log($"[Switch 完了] target={targetType}");
+                return true;
+            }
+            finally
+            {
+                Interlocked.Exchange(ref switchingRenderTarget, 0);
             }
         }
 
@@ -279,9 +415,18 @@ namespace CSharpFFPlayer
 
             FlushQueues();
 
+            // 描画リソースは差し替えゲートの内側で破棄し、参照も切っておく
+            // （破棄済みの D3D9 デバイスを掴んだままにしないため）
+            lock (renderSwapGate)
+            {
+                imageWriter?.Dispose();
+                imageWriter = null;
+                frameConveter?.Dispose();
+                frameConveter = null;
+            }
+
             audioPlayer?.Dispose();
             decoder?.Dispose();
-            frameConveter?.Dispose();
 
             Log("再生停止。リソース解放済み。");
         }
@@ -327,14 +472,18 @@ namespace CSharpFFPlayer
                 // 4) UI に提示。CPU/D3D で入れる先を分ける
                 if (targetFrame != null)
                 {
-                    if (IsCpuTarget)
+                    // 描画ターゲット差し替えと排他
+                    lock (renderSwapGate)
                     {
-                        imageWriter.EnqueueFrame(targetFrame);
-                        cpuFrames.Enqueue(targetFrame);
-                    }
-                    else
-                    {
-                        gpuFrames.Enqueue(targetFrame);
+                        if (IsCpuTarget)
+                        {
+                            imageWriter?.EnqueueFrame(targetFrame);
+                            cpuFrames.Enqueue(targetFrame);
+                        }
+                        else
+                        {
+                            gpuFrames.Enqueue(targetFrame);
+                        }
                     }
                 }
                 else
@@ -366,6 +515,12 @@ namespace CSharpFFPlayer
         // ----------------------------------
         private async Task SeekAudioAsync(int videoFrameIndex)
         {
+            if (audioPlayer == null)
+            {
+                Warn("[音声シーク] AudioPlayer 未初期化のためスキップします。");
+                return;
+            }
+
             var aStream = decoder.AudioStream;
             var atb = aStream.time_base;
 
@@ -507,7 +662,7 @@ namespace CSharpFFPlayer
 
                     // --- フレーム取得→提示 ---
                     var mf = DequeueForTarget();
-                    int delay = 1;
+                    float delay = 0f;
                     unsafe
                     {
                         if (mf != null && mf.Frame != null)
@@ -540,14 +695,14 @@ namespace CSharpFFPlayer
 
                             long nowTicks = sw.ElapsedTicks;
                             float usedMs = (nowTicks - lastTicks) * tickToMs;
-                            lastTicks = nowTicks;
-                            delay = (int)MathF.Max(0, baseFrameDurationMs - usedMs - offset);
-                            Console.WriteLine($"[Draw] idx={frameIndex} 描画にかかった時間={usedMs}ms");
+                            delay = MathF.Max(0, baseFrameDurationMs - usedMs - offset);
+                            Console.WriteLine($"[Draw] idx={frameIndex} used={usedMs}ms delay={delay}ms");
                         }
                     }
 
-                    await Task.Delay(delay);
+                    await Task.Delay((int)delay);
 
+                    lastTicks = sw.ElapsedTicks;
                 }
             }
             catch (Exception e)
@@ -579,17 +734,27 @@ namespace CSharpFFPlayer
 
         private void EnqueueForUi(ManagedFrame frame)
         {
-            if (IsCpuTarget)
+            // 描画ターゲット差し替えと排他。ここでは await しないこと。
+            lock (renderSwapGate)
             {
-                imageWriter.EnqueueFrame(frame);
-            }
-            else
-            {
-                // D3DImage では BGRA を渡して表示
-                byte[] bgra = decoder.GetBgraFrame(frame, frameConveter, bt709: true);
-                imageWriter.PresentBgra(bgra);
-                // ManagedFrame は UnifiedImageWriter 側に渡さないので、ここで解放
-                frame.Dispose();
+                if (imageWriter == null || frameConveter == null)
+                {
+                    frame.Dispose();
+                    return;
+                }
+
+                if (IsCpuTarget)
+                {
+                    imageWriter.EnqueueFrame(frame);
+                }
+                else
+                {
+                    // D3DImage では BGRA を渡して表示
+                    byte[] bgra = decoder.GetBgraFrame(frame, frameConveter, bt709: true);
+                    imageWriter.PresentBgra(bgra);
+                    // ManagedFrame は UnifiedImageWriter 側に渡さないので、ここで解放
+                    frame.Dispose();
+                }
             }
         }
 

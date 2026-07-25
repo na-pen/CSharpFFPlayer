@@ -49,6 +49,12 @@ namespace CSharpFFPlayer
         private Texture? sysmemTex;
         private Surface? sysmemSurf;
 
+        // --- 破棄済みフラグ ---
+        // 描画ターゲット切り替え時、Dispatcher に積まれたままの描画要求が
+        // 破棄済みデバイスに触れないようにするためのガード。
+        private volatile bool disposed = false;
+        public bool IsDisposed => disposed;
+
         // --- 合流描画（最新だけ） ---
         private readonly object presentLock = new();
         private bool presentPending = false;
@@ -89,6 +95,8 @@ namespace CSharpFFPlayer
         // =========================================================
         public void EnqueueFrame(ManagedFrame newFrame)
         {
+            if (disposed) { newFrame?.Dispose(); return; }
+
             // 最新のみ残す
             while (renderQueue.TryDequeue(out var old)) old.Dispose();
             renderQueue.Enqueue(newFrame);
@@ -105,6 +113,8 @@ namespace CSharpFFPlayer
         private void RenderLatestFrame()
         {
             isRenderPending = false;
+
+            if (disposed) { ClearQueue(); return; }
 
             if (!renderQueue.TryDequeue(out var latest))
                 return;
@@ -164,6 +174,7 @@ namespace CSharpFFPlayer
         public void PresentBgra(byte[] bgra, Action<byte[]>? onConsumed = null)
         {
             if (bgra == null) return;
+            if (disposed) { onConsumed?.Invoke(bgra); return; }
             if (bgra.Length < width * height * 4)
                 Log($"[Warn] BGRA サイズが小さい: {bgra.Length} < {width * height * 4}");
 
@@ -201,6 +212,7 @@ namespace CSharpFFPlayer
             try
             {
                 if (current == null) return;
+                if (disposed) return;
 
                 if (targetType == RenderTargetType.WriteableBitmap)
                 {
@@ -373,8 +385,18 @@ namespace CSharpFFPlayer
 
         public void Dispose()
         {
+            if (disposed) return;
+            disposed = true;
+
             Log("Dispose()");
             ClearQueue();
+
+            lock (presentLock)
+            {
+                pendingBgra = null;
+                pendingOnConsumed = null;
+                presentPending = false;
+            }
 
             // sysmem
             sysmemSurf?.Dispose(); sysmemSurf = null;

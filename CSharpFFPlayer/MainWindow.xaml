@@ -63,6 +63,42 @@
                     </MenuItem>
                 </mahApps:DropDownButton.Items>
             </mahApps:DropDownButton>
+
+            <mahApps:DropDownButton Content="表示" Foreground="White">
+                <mahApps:DropDownButton.Items>
+
+                    <MenuItem
+                        x:Name="MenuRenderWriteableBitmap"
+                        Height="23"
+                        Click="RenderTarget_Click"
+                        IsCheckable="True"
+                        Tag="WriteableBitmap">
+                        <MenuItem.Header>
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                FontSize="13"
+                                Text="通常描画 (WriteableBitmap)"
+                                TextAlignment="Left" />
+                        </MenuItem.Header>
+                    </MenuItem>
+
+                    <MenuItem
+                        x:Name="MenuRenderD3DImage"
+                        Height="23"
+                        Click="RenderTarget_Click"
+                        IsCheckable="True"
+                        Tag="D3DImage">
+                        <MenuItem.Header>
+                            <TextBlock
+                                VerticalAlignment="Center"
+                                FontSize="13"
+                                Text="D3D描画 (D3DImage)"
+                                TextAlignment="Left" />
+                        </MenuItem.Header>
+                    </MenuItem>
+                </mahApps:DropDownButton.Items>
+            </mahApps:DropDownButton>
+
             <Button Content="settings" />
         </mahApps:WindowCommands>
     </mahApps:MetroWindow.LeftWindowCommands>
